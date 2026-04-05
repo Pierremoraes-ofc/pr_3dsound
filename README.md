@@ -3,7 +3,7 @@
 <div align="center">
 
 [![GitBook](https://img.shields.io/badge/📖_Documentação_Completa-GitBook-blue?style=for-the-badge)](https://pierremoraes.gitbook.io/home/fivem/pr-3d-sound)
-[![fivem_bridge](https://img.shields.io/badge/⚡_pr_3dsound-Standalone-green?style=for-the-badge)](https://github.com/Pierremoraes-ofc/pr_3dsound)
+
 
 </div>
 
@@ -45,6 +45,6 @@ Sistema de áudio 3D para FiveM com suporte a:
 <div align="center">
 
 [![GitBook](https://img.shields.io/badge/📖_Full_Documentation-GitBook-blue?style=for-the-badge)](https://pierremoraes.gitbook.io/home/fivem/pr-3d-sound)
-[![fivem_bridge](https://img.shields.io/badge/⚡pr_3dsound-Standalone-green?style=for-the-badge)](https://github.com/Pierremoraes-ofc/pr_3dsound)
+
 
 </div>
