@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>pr_3dsound</title>
+
+    <!--
+        Howler 2.2.3 — áudio local + streams http
+        Spatial para posicionamento HRTF 3D
+    -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/howler/2.2.3/howler.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/howler/2.2.3/howler.spatial.min.js"></script>
+
+    <!-- jQuery (mantido para compatibilidade com $.post NUI) -->
+    <script src="nui://game/ui/jquery.js"></script>
+
+    <!-- DOMPurify — sanitiza URLs antes de carregar qualquer fonte externa -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.3/purify.min.js"></script>
+
+    <!--
+        YouTube IFrame API
+        Será carregada de forma assíncrona; onYouTubeIframeAPIReady
+        é chamado automaticamente quando pronta.
+        Nota: vídeos com embedding desativado pelo autor não poderão ser
+        reproduzidos — o YouTube retornará erro 101/150 nesses casos.
+    -->
+    <script src="https://www.youtube.com/iframe_api" async></script>
+
+    <style>
+        html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+        #trash      { display: none; }
+    </style>
+</head>
+<body>
+    <!-- Container oculto onde os iframes do YouTube são injetados -->
+    <div id="trash"></div>
+
+    <!-- Motor de players (Howler + YouTube IFrame) -->
+    <script src="./scripts/SoundPlayer.js"></script>
+
+    <!-- Listener de mensagens NUI -->
+    <script src="./scripts/listener.js"></script>
+</body>
+</html>
