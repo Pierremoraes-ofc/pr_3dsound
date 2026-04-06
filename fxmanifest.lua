@@ -3,8 +3,8 @@ game 'gta5'
 
 author 'PierreMoraes'
 name 'pr_3dsound'
-description '3D sound system — local files, URL streams, YouTube, SoundCloud'
-version '2.0.0'
+description '3D sound system — local files, URL streams, YouTube, SoundCloud embed'
+version '3.0.0'
 
 client_scripts {
     'client/client.lua',

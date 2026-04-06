@@ -19,12 +19,16 @@
 
     <!--
         YouTube IFrame API
-        Será carregada de forma assíncrona; onYouTubeIframeAPIReady
-        é chamado automaticamente quando pronta.
-        Nota: vídeos com embedding desativado pelo autor não poderão ser
-        reproduzidos — o YouTube retornará erro 101/150 nesses casos.
+        onYouTubeIframeAPIReady é chamado automaticamente quando pronta.
+        Nota: vídeos com embedding desativado pelo autor retornam erro 101/150.
     -->
     <script src="https://www.youtube.com/iframe_api" async></script>
+
+    <!--
+        SoundCloud Widget API
+        Permite controlar iframes do SoundCloud via postMessage.
+    -->
+    <script src="https://w.soundcloud.com/player/api.js" async></script>
 
     <style>
         html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
@@ -32,10 +36,10 @@
     </style>
 </head>
 <body>
-    <!-- Container oculto onde os iframes do YouTube são injetados -->
+    <!-- Container oculto onde os iframes do YouTube e SoundCloud são injetados -->
     <div id="trash"></div>
 
-    <!-- Motor de players (Howler + YouTube IFrame) -->
+    <!-- Motor de players (Howler + YouTube IFrame + SoundCloud Widget) -->
     <script src="./scripts/SoundPlayer.js"></script>
 
     <!-- Listener de mensagens NUI -->

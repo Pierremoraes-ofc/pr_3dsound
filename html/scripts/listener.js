@@ -1,5 +1,5 @@
 /**
- * pr_3dsound — listener.js  v2.0
+ * pr_3dsound — listener.js  v3.0
  * Recebe todas as mensagens NUI vindas do client.lua e delega ao SoundPlayer.
  */
 
@@ -32,6 +32,13 @@ window.addEventListener('message', function (event) {
         // ── Atualização de posição / volume do listener (loop 3D) ─────────────
         case 'updateVolume':
             sp.updateVolume(i, d.volume, d.playerPos, d.camDir);
+            break;
+
+        // ── Oclusão (raycast / veículo / MLO) ────────────────────────────────
+        // occlusionMult: 1.0 = sem oclusão, 0.0 = mudo
+        // freq: reservado para futuro uso (ex: filtro lowpass)
+        case 'setFilter':
+            sp.setFilter(i, d.freq || 22050, d.occlusionMult !== undefined ? d.occlusionMult : 1.0);
             break;
 
         // ── Controles básicos ─────────────────────────────────────────────────
