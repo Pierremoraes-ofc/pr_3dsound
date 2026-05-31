@@ -1,5 +1,5 @@
 -- bridge/version.lua  (carregado no shared_scripts)
-local CURRENT_VERSION = "2.0.1"
+local CURRENT_VERSION = "3.0.2"
 local REPO_OWNER      = "Pierremoraes-ofc"
 local REPO_NAME       = "pr_3dsound"
 

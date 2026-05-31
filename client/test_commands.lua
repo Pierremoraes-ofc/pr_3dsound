@@ -3,23 +3,23 @@
     Comandos de teste via chat. REMOVA EM PRODUÇÃO!
 
     ╔══════════════════════════════════════════════════════════════════════╗
-    ║  /play      <url> [vol] [raio]   → URL 3D na sua posição            ║
-    ║  /play2d    <url> [vol]          → URL 2D global                    ║
-    ║  /playfile  <arq> [vol] [raio]   → arquivo local 3D                 ║
-    ║  /playcar   <url> [vol] [raio]   → URL 3D no veículo (auto-attach)  ║
-    ║  /spause    <id>                 → pausar                           ║
-    ║  /sresume   <id>                 → retomar                          ║
-    ║  /sstop     <id>                 → parar                            ║
-    ║  /svol      <id> <0-1>          → volume                           ║
-    ║  /sdist     <id> <metros>       → raio                             ║
-    ║  /sloop     <id> <on|off>       → loop                             ║
-    ║  /sfade     <id> <in|out> [ms]  → fade                             ║
-    ║  /smove     <id>                 → mover p/ sua posição             ║
-    ║  /sattach   <id> <netId>        → attach em entity                  ║
-    ║  /sdetach   <id>                 → remover attach                   ║
-    ║  /sinfo     <id>                 → estado do som                    ║
-    ║  /sstopall                       → parar tudo                       ║
-    ║  /sound                          → lista de comandos                ║
+    ║  /play      <url> [vol] [raio]   → URL 3D na sua posição             ║
+    ║  /play2d    <url> [vol]          → URL 2D global                     ║
+    ║  /playfile  <arq> [vol] [raio]   → arquivo local 3D                  ║
+    ║  /playcar   <url> [vol] [raio]   → URL 3D no veículo (auto-attach)   ║
+    ║  /spause    <id>                 → pausar                            ║
+    ║  /sresume   <id>                 → retomar                           ║
+    ║  /sstop     <id>                 → parar                             ║
+    ║  /svol      <id> <0-1>          → volume                             ║
+    ║  /sdist     <id> <metros>       → raio                               ║
+    ║  /sloop     <id> <on|off>       → loop                               ║
+    ║  /sfade     <id> <in|out> [ms]  → fade                               ║
+    ║  /smove     <id>                 → mover p/ sua posição              ║
+    ║  /sattach   <url> <netId> [vol] [raio] → play + attach em entity      ║
+    ║  /sdetach   <id>                 → remover attach                    ║
+    ║  /sinfo     <id>                 → estado do som                     ║
+    ║  /sstopall                       → parar tudo                        ║
+    ║  /sound                          → lista de comandos                 ║
     ╚══════════════════════════════════════════════════════════════════════╝
 ]]
 
@@ -211,14 +211,28 @@ RegisterCommand('smove', function(source, args)
 end, false)
 
 -- ─── /sattach ────────────────────────────────────────────────────────────────
+-- Uso: /sattach <url> <netId> [vol] [raio]
+-- Inicia um som 3D já attachado em qualquer entity via netId.
+-- Sem race condition: play e attach são enviados juntos ao server.
 
 RegisterCommand('sattach', function(source, args)
-    local id    = args[1]
-    local netId = tonumber(args[2])
-    if not checkId(id) then return end
-    if not netId then err('Uso: /sattach <id> <entityNetId>'); return end
-    TriggerServerEvent('pr_3dsound:server:attachToEntity', id, netId, { x = 0, y = 0, z = 0 })
-    ok(('Som ^3%s^7 attachado ao entity ^3%d'):format(id, netId))
+    local url    = args[1]
+    local netId  = tonumber(args[2])
+    local volume = tonumber(args[3]) or 0.8
+    local radius = tonumber(args[4]) or 30.0
+
+    if not url   then err('Uso: /sattach <url> <netId> [vol] [raio]'); return end
+    if not netId then err('Uso: /sattach <url> <netId> [vol] [raio]'); return end
+
+    local id = genId()
+
+    TriggerServerEvent('pr_3dsound:server:attachSoundToEntity', id, url, volume, netId, radius, true)
+
+    ok('|>> Som attachado iniciado!')
+    ok(('    ID    : ^3%s'):format(id))
+    inf(('    URL   : %s'):format(url))
+    inf(('    NetId : %d  |  Vol: %.2f  |  Raio: %.0f m'):format(netId, volume, radius))
+    inf('    Use ^3/sstop ' .. id .. '^7 para parar.')
 end, false)
 
 -- ─── /sdetach ────────────────────────────────────────────────────────────────
@@ -270,7 +284,7 @@ RegisterCommand('sound', function()
     inf('^3/sloop     ^7<id> <on|off>        → loop')
     inf('^3/sfade     ^7<id> <in|out> [ms]   → fade')
     inf('^3/smove     ^7<id>                  → mover p/ sua posição')
-    inf('^3/sattach   ^7<id> <netId>         → attach em entity')
+    inf('^3/sattach   ^7<url> <netId> [vol] [raio] → play + attach em entity')
     inf('^3/sdetach   ^7<id>                  → remover attach')
     inf('^3/sinfo     ^7<id>                  → ver estado')
     inf('^3/sstopall                          → parar tudo')

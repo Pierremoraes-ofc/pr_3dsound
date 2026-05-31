@@ -380,13 +380,21 @@ end)
 RegisterNetEvent('pr_3dsound:client:attachToEntity')
 AddEventHandler('pr_3dsound:client:attachToEntity', function(index, entityNetId, offset)
     if not Sounds[index] then return end
-    local entity = NetToEnt(entityNetId)
-    if not DoesEntityExist(entity) then
-        print('[pr_3dsound] WARN: entity não encontrada, netId=' .. tostring(entityNetId))
-        return
+
+    local function tryAttach(attempts)
+        if not Sounds[index] then return end
+        local entity = NetToEnt(entityNetId)
+        if DoesEntityExist(entity) then
+            Sounds[index].attachEntity = entity
+            Sounds[index].attachOffset = offset or { x = 0, y = 0, z = 0 }
+        elseif attempts > 0 then
+            Citizen.SetTimeout(500, function() tryAttach(attempts - 1) end)
+        else
+            print('[pr_3dsound] WARN: entity netId=' .. tostring(entityNetId) .. ' nao encontrada apos retries')
+        end
     end
-    Sounds[index].attachEntity = entity
-    Sounds[index].attachOffset = offset or { x = 0, y = 0, z = 0 }
+
+    tryAttach(10) -- tenta por 5s (10x a cada 500ms)
 end)
 
 RegisterNetEvent('pr_3dsound:client:detachEntity')
