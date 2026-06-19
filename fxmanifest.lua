@@ -8,11 +8,13 @@ version '3.0.2'
 
 client_scripts {
     'client/client.lua',
+    'client/native_sound.lua',
     'client/test_commands.lua',  -- REMOVA EM PRODUÇÃO
 }
 
 server_scripts {
-    'server/server.lua'
+    'server/server.lua',
+    'server/native_sound.lua'
 }
 
 ui_page 'html/index.html'
