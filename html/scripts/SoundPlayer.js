@@ -238,11 +238,12 @@ function cleanupPlayer(index) {
 
 function createHowl(src, volume, loop, is3D, pos, onEnd) {
     var isStream = /^https?:\/\//i.test(src);
+    var useHtml5 = isStream || /\.ogg(?:$|\?)/i.test(src);
     var h = new Howl({
         src:    [src],
         volume: volume,
         loop:   loop || false,
-        html5:  isStream,
+        html5:  useHtml5,
         onend:  function () { if (!loop && onEnd) onEnd(); },
         onloaderror: function (id, err) { console.error('[pr_3dsound] Falha ao carregar:', src, err); },
         onplayerror: function (id, err) {

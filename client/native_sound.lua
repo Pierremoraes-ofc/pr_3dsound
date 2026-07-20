@@ -14,10 +14,14 @@ local function copyPayload(data)
     if type(data) ~= 'table' then return end
 
     local payload = {}
-    for key, value in pairs(data) do
+    local lastKey = nil
+    while true do
+        local ok, key, value = pcall(next, data, lastKey)
+        if not ok or key == nil then break end
         if key ~= 'entity' then
             payload[key] = value
         end
+        lastKey = key
     end
 
     return payload
@@ -231,10 +235,7 @@ local function playSoundFromEntity(data)
     names, audioRef = applyOcclusion(data, names, audioRef, coords, entity)
     if not names then return false end
 
-    local payload = {}
-    for key, value in pairs(data) do
-        payload[key] = value
-    end
+    local payload = copyPayload(data) or {}
     payload.audioName = names
     payload.audioRef = audioRef
 
@@ -262,10 +263,7 @@ local function playSoundFromCoords(data)
     names, audioRef = applyOcclusion(data, names, audioRef, coords, nil)
     if not names then return false end
 
-    local payload = {}
-    for key, value in pairs(data) do
-        payload[key] = value
-    end
+    local payload = copyPayload(data) or {}
     payload.audioName = names
     payload.audioRef = audioRef
 

@@ -74,6 +74,30 @@ local function calcDistanceVolume(s, coords)
     return clamp((s.maxVol or s.vol) - (dist * mult), 0.0, 1.0)
 end
 
+local function snapshotSoundKeys()
+    local keys = {}
+    local lastKey = nil
+    while true do
+        local ok, key = pcall(next, Sounds, lastKey)
+        if not ok or key == nil then break end
+        keys[#keys + 1] = key
+        lastKey = key
+    end
+    return keys
+end
+
+local function findSoundByUniqueId(uniqueId)
+    local keys = snapshotSoundKeys()
+    for i = 1, #keys do
+        local k = keys[i]
+        local v = Sounds[k]
+        if v and v.uniqueId == uniqueId then
+            return k, v
+        end
+    end
+    return nil, nil
+end
+
 local function getHeadCoords(ped)
     local c = GetEntityCoords(ped)
     return vector3(c.x, c.y, c.z + 0.7)
@@ -235,8 +259,11 @@ local function startLoop()
             local playerVehMult = getPlayerVehicleMult(ped)
 
             -- ① Resolve rays do tick anterior
-            for k, v in pairs(Sounds) do
-                if v.playing and not v.is2D then
+            local soundKeys = snapshotSoundKeys()
+            for i = 1, #soundKeys do
+                local k = soundKeys[i]
+                local v = Sounds[k]
+                if v and v.playing and not v.is2D then
                     local resolved = resolveRay(k)
                     if resolved ~= nil then
                         local prev = smoothedMult[k] or resolved
@@ -246,8 +273,11 @@ local function startLoop()
             end
 
             -- ② Processa emitters
-            for k, v in pairs(Sounds) do
-                if v.playing and not v.is2D then
+            soundKeys = snapshotSoundKeys()
+            for i = 1, #soundKeys do
+                local k = soundKeys[i]
+                local v = Sounds[k]
+                if v and v.playing and not v.is2D then
                     emittersActive = emittersActive + 1
 
                     -- Auto-update coords para attachs
@@ -501,28 +531,33 @@ end)
 
 -- Estado
 exports('SoundExists', function(uniqueId)
-    for _, v in pairs(Sounds) do if v.uniqueId == uniqueId then return true end end
-    return false
+    return findSoundByUniqueId(uniqueId) ~= nil
 end)
 
 exports('IsPlaying', function(uniqueId)
-    for _, v in pairs(Sounds) do if v.uniqueId == uniqueId then return v.playing end end
+    local _, v = findSoundByUniqueId(uniqueId)
+    if v then return v.playing end
     return false
 end)
 
 exports('IsPaused', function(uniqueId)
-    for _, v in pairs(Sounds) do if v.uniqueId == uniqueId then return v.paused end end
+    local _, v = findSoundByUniqueId(uniqueId)
+    if v then return v.paused end
     return false
 end)
 
 exports('GetInfo', function(uniqueId)
-    for _, v in pairs(Sounds) do if v.uniqueId == uniqueId then return v end end
-    return nil
+    local _, v = findSoundByUniqueId(uniqueId)
+    return v
 end)
 
 exports('GetAllSounds', function()
     local result = {}
-    for _, v in pairs(Sounds) do result[v.uniqueId] = v end
+    local keys = snapshotSoundKeys()
+    for i = 1, #keys do
+        local v = Sounds[keys[i]]
+        if v then result[v.uniqueId] = v end
+    end
     return result
 end)
 
@@ -568,78 +603,57 @@ end)
 
 -- Controles client-side
 exports('Stop', function(uniqueId)
-    for k, v in pairs(Sounds) do
-        if v.uniqueId == uniqueId then
-            v.playing = false
-            SendNUIMessage({ type = 'stop', soundIndex = k })
-            Sounds[k] = nil
-            return true
-        end
-    end
-    return false
+    local k, v = findSoundByUniqueId(uniqueId)
+    if not k or not v then return false end
+    v.playing = false
+    SendNUIMessage({ type = 'stop', soundIndex = k })
+    Sounds[k] = nil
+    return true
 end)
 
 exports('Pause', function(uniqueId)
-    for k, v in pairs(Sounds) do
-        if v.uniqueId == uniqueId then
-            v.playing = false; v.paused = true
-            SendNUIMessage({ type = 'pause', soundIndex = k })
-            return true
-        end
-    end
-    return false
+    local k, v = findSoundByUniqueId(uniqueId)
+    if not k or not v then return false end
+    v.playing = false; v.paused = true
+    SendNUIMessage({ type = 'pause', soundIndex = k })
+    return true
 end)
 
 exports('Resume', function(uniqueId)
-    for k, v in pairs(Sounds) do
-        if v.uniqueId == uniqueId then
-            v.playing = true; v.paused = false
-            SendNUIMessage({ type = 'resume', soundIndex = k })
-            startLoop()
-            return true
-        end
-    end
-    return false
+    local k, v = findSoundByUniqueId(uniqueId)
+    if not k or not v then return false end
+    v.playing = true; v.paused = false
+    SendNUIMessage({ type = 'resume', soundIndex = k })
+    startLoop()
+    return true
 end)
 
 exports('SetVolume', function(uniqueId, volume)
-    for k, v in pairs(Sounds) do
-        if v.uniqueId == uniqueId then
-            v.vol = clamp(volume, 0.0, 1.0)
-            SendNUIMessage({ type = 'setVolume', soundIndex = k, volume = v.vol })
-            return true
-        end
-    end
-    return false
+    local k, v = findSoundByUniqueId(uniqueId)
+    if not k or not v then return false end
+    v.vol = clamp(volume, 0.0, 1.0)
+    SendNUIMessage({ type = 'setVolume', soundIndex = k, volume = v.vol })
+    return true
 end)
 
 exports('SetDistance', function(uniqueId, dist)
-    for k, v in pairs(Sounds) do
-        if v.uniqueId == uniqueId then
-            v.dist = dist
-            SendNUIMessage({ type = 'setDistance', soundIndex = k, distance = dist })
-            return true
-        end
-    end
-    return false
+    local k, v = findSoundByUniqueId(uniqueId)
+    if not k or not v then return false end
+    v.dist = dist
+    SendNUIMessage({ type = 'setDistance', soundIndex = k, distance = dist })
+    return true
 end)
 
 exports('FadeIn', function(uniqueId, duration, targetVolume)
-    for k, v in pairs(Sounds) do
-        if v.uniqueId == uniqueId then
-            SendNUIMessage({ type = 'fadeIn', soundIndex = k, duration = duration or 1000, volume = targetVolume or 1.0 })
-            return true
-        end
-    end
-    return false
+    local k = findSoundByUniqueId(uniqueId)
+    if not k then return false end
+    SendNUIMessage({ type = 'fadeIn', soundIndex = k, duration = duration or 1000, volume = targetVolume or 1.0 })
+    return true
 end)
 
 exports('FadeOut', function(uniqueId, duration)
-    for k, v in pairs(Sounds) do
-        if v.uniqueId == uniqueId then
-            SendNUIMessage({ type = 'fadeOut', soundIndex = k, duration = duration or 1000 })
-            return true
-        end
-    end
-    return false
+    local k = findSoundByUniqueId(uniqueId)
+    if not k then return false end
+    SendNUIMessage({ type = 'fadeOut', soundIndex = k, duration = duration or 1000 })
+    return true
 end)
