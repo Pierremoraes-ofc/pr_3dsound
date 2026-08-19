@@ -1,112 +1,152 @@
-# pr_3dsound
+# pr_3dsound — v4.0.0 custom
 
-> Sistema de som 3D para FiveM com oclusão por raycast, paredes, portas de veículo e portais MLO.
-> 3D sound system for FiveM with raycast occlusion, walls, vehicle doors and MLO portals.
+Resource de áudio 3D para FiveM com arquivos locais, URLs diretas, YouTube, SoundCloud, attach em entities, oclusão e streaming dinâmico por proximidade.
 
----
+## O que foi corrigido nesta build
 
-## 🇺🇸 English
+- **URL direta com HRTF real**: `PlayUrlPos` e `PlayUrlAttached` usam `HTMLAudioElement -> MediaElementSource -> PannerNode(HRTF) -> low-pass -> Gain` quando o host permite CORS.
+- **Fallback seguro**: se a URL direta não puder ser roteada pelo Web Audio, a resource tenta reproduzir via HTML5/Howler. Nesse fallback há distância/oclusão, mas não HRTF verdadeiro.
+- **Emitters persistentes**: o servidor mantém o estado dos sons posicionais e decide dinamicamente quem deve ouvi-los.
+- **Late join / reentrada no raio**: quem entra depois recebe o som automaticamente com o timestamp correspondente.
+- **Attach persistente**: o servidor acompanha o `Network ID`; o client tenta resolver novamente a entity quando ela entra no scope do OneSync.
+- **Histerese de proximidade**: reduz play/stop repetitivo quando o player fica na borda do raio.
+- **Índices server-side separados**: sons criados pelo servidor usam IDs internos acima de `100000`, evitando colisão com sons locais criados no client.
+- **Estado autoritativo**: pause, resume, volume, distância, loop e timestamp são mantidos no servidor para novos listeners.
+- **Oclusão melhorada**: URLs diretas 3D recebem low-pass real além da redução de volume.
+- **Eventos protegidos**: clients não podem assumir ou controlar sons de outros scripts; broadcast vindo do client exige ACE.
+- **Comandos de teste desabilitados por padrão**.
 
+## Instalação
 
-<div align="center">
+1. Coloque a pasta `pr_3dsound` em `resources`.
+2. Adicione ao `server.cfg`:
 
-[![GitBook](https://img.shields.io/badge/📖_Documentação_Completa-GitBook-blue?style=for-the-badge)](https://pierremoraes.gitbook.io/home/fivem/pr-3d-sound)
-
-
-</div>
-
-### What it is
-
-`pr_3dsound` is a 3D audio resource for FiveM servers. It plays positional sounds in the game world with distance attenuation and realistic acoustic occlusion, supporting local files, direct streams, YouTube and SoundCloud.
-
-### Key features
-
-- **Audio sources**: local `.ogg/.mp3/.weba` files, HTTP/HTTPS streams, YouTube (IFrame API) and SoundCloud (Widget API)
-- **3D positioning**: volume attenuated by distance with per-sound configurable radius
-- **Entity attach**: sound follows any entity (vehicle, ped, object) automatically
-- **Raycast occlusion**: detects walls between player and sound source using two-frame `StartShapeTestLosProbe` to eliminate flickering
-- **Vehicle occlusion (source)**: sound attached to a car leaks less when doors/windows are closed; player inside the same car always hears 100%
-- **Vehicle occlusion (player)**: player inside their own car hears external sounds more muffled as windows/doors are closed
-- **MLO portal occlusion**: detects if player and source are in different rooms of an interior and applies proportional muffling
-- **Full control**: pause, resume, stop, volume, radius, loop, timestamp, fade in/out
-- **YouTube no-delay**: starts muted to bypass CEF autoplay policy; unmutes automatically once playback is confirmed
-
-### Installation
-
-1. Copy the `pr_3dsound` folder to your server's `resources` directory
-2. Add `ensure pr_3dsound` to `server.cfg`
-3. Remove `client/test_commands.lua` from `fxmanifest.lua` in production
-
-### Quick usage (server-side)
-
-```lua
--- Vehicle music (automatic door/window occlusion)
-exports['pr_3dsound']:PlayUrlAttached(source, 'car_music', url, 0.8, VehToNet(vehicle), 30.0, true)
-
--- Fixed 3D sound in the world
-exports['pr_3dsound']:PlayUrlPos(-1, 'bar_sound', url, 0.7, coords, 40.0, true)
-
--- Global 2D sound (everyone hears)
-exports['pr_3dsound']:PlayUrl(-1, 'announcement', url, 0.9, false)
-
--- Stop
-exports['pr_3dsound']:Stop('car_music')
+```cfg
+ensure pr_3dsound
 ```
 
----
+3. Para produção, deixe `client/test_commands.lua` comentado no `fxmanifest.lua`.
 
-## Licença / License
+## Uso recomendado: server-side
 
-MIT — use livre, atribuição apreciada.  
-MIT — free to use, attribution appreciated.
-
-
-
-## 🇧🇷 Português
-
-
-<div align="center">
-
-[![GitBook](https://img.shields.io/badge/📖_Documentação_Completa-GitBook-blue?style=for-the-badge)](https://pierremoraes.gitbook.io/home/fivem/pr-3d-sound)
-
-
-</div>
-### O que é
-
-`pr_3dsound` é um recurso de áudio 3D para servidores FiveM. Ele reproduz sons posicionais no mundo do jogo com atenuação por distância e oclusão acústica realista, suportando arquivos locais, streams diretos, YouTube e SoundCloud.
-
-### Recursos principais
-
-- **Fontes de áudio**: arquivos `.ogg/.mp3/.weba` locais, streams HTTP/HTTPS, YouTube (IFrame API) e SoundCloud (Widget API)
-- **Posicionamento 3D**: volume atenuado por distância com raio configurável por som
-- **Attach em entity**: som segue qualquer entity (veículo, ped, objeto) automaticamente
-- **Oclusão por raycast**: detecta paredes entre o player e a fonte de som usando `StartShapeTestLosProbe` em dois frames para eliminar oscilação
-- **Oclusão de veículo (fonte)**: som attachado a um carro vaza menos quando as portas/janelas estão fechadas; o player dentro do mesmo carro sempre ouve 100%
-- **Oclusão de veículo (player)**: player dentro do próprio carro ouve sons externos mais abafados conforme as janelas/portas estão fechadas
-- **Oclusão por portais MLO**: detecta se player e fonte estão em rooms diferentes de um interior e aplica abafamento proporcional
-- **Controle completo**: pause, resume, stop, volume, raio, loop, timestamp, fade in/out
-- **YouTube sem delay**: inicia mutado para bypassar a política de autoplay do CEF; desmuta automaticamente ao confirmar reprodução
-
-### Instalação
-
-1. Copie a pasta `pr_3dsound` para o diretório `resources` do seu servidor
-2. Adicione `ensure pr_3dsound` no `server.cfg`
-3. Remova `client/test_commands.lua` do `fxmanifest.lua` em produção
-
-### Uso rápido (server-side)
+### Som 3D fixo
 
 ```lua
--- Música num veículo (oclusão automática por porta/janela)
-exports['pr_3dsound']:PlayUrlAttached(source, 'musica_carro', url, 0.8, VehToNet(vehicle), 30.0, true)
-
--- Som 3D fixo no mundo
-exports['pr_3dsound']:PlayUrlPos(-1, 'som_bar', url, 0.7, coords, 40.0, true)
-
--- Som 2D global (todos ouvem)
-exports['pr_3dsound']:PlayUrl(-1, 'anuncio', url, 0.9, false)
-
--- Parar
-exports['pr_3dsound']:Stop('musica_carro')
+exports['pr_3dsound']:PlayUrlPos(
+    -1,
+    'radio_praca',
+    'https://seu-cdn.com/audio/radio.mp3',
+    0.8,
+    vector3(215.0, -810.0, 30.0),
+    45.0,
+    true
+)
 ```
 
----
+### Som 3D preso a veículo
+
+```lua
+local netId = NetworkGetNetworkIdFromEntity(vehicle)
+
+exports['pr_3dsound']:PlayUrlAttached(
+    -1,
+    'som_carro_' .. netId,
+    'https://seu-cdn.com/audio/musica.mp3',
+    0.8,
+    netId,
+    35.0,
+    true
+)
+```
+
+O `-1` significa emitter compartilhado. Qualquer jogador elegível que entrar no raio recebe o som. Se você passar um `source` específico, somente esse player será elegível.
+
+### Arquivo local em `html/sounds/`
+
+```lua
+exports['pr_3dsound']:Play(
+    vector3(100.0, 200.0, 30.0),
+    'pr-wep/pistola.ogg',
+    1.0,
+    50.0,
+    'tiro_01',
+    nil,
+    false
+)
+```
+
+### Controles
+
+```lua
+exports['pr_3dsound']:Pause('radio_praca')
+exports['pr_3dsound']:Resume('radio_praca')
+exports['pr_3dsound']:SetVolume('radio_praca', 0.5)
+exports['pr_3dsound']:SetDistance('radio_praca', 60.0)
+exports['pr_3dsound']:SetTimestamp('radio_praca', 25.0)
+exports['pr_3dsound']:SetLoop('radio_praca', true)
+exports['pr_3dsound']:Stop('radio_praca')
+```
+
+## CORS: necessário para URL 3D real
+
+Para HRTF verdadeiro em uma URL direta, o servidor/CDN que hospeda o áudio precisa aceitar CORS. O ideal é servir algo como:
+
+```http
+Access-Control-Allow-Origin: *
+```
+
+ou permitir explicitamente a origem usada pela NUI.
+
+Sem CORS, a resource tenta fallback para reprodução compatível. O áudio ainda pode tocar com distância/oclusão, mas sem panning HRTF real.
+
+## YouTube e SoundCloud
+
+YouTube e SoundCloud continuam usando iframe/widget. O browser não permite capturar o áudio cross-origin desses players e conectá-lo ao `PannerNode`.
+
+Portanto:
+
+- URL direta: **HRTF real quando CORS permite**.
+- YouTube/SoundCloud: **distância + volume + oclusão simulada**, sem HRTF real.
+
+Para caixas de som, carros, rádios e ambientes onde o posicionamento importa, prefira uma URL direta para `.mp3`, `.ogg`, `.weba` ou um stream compatível.
+
+## Streams ao vivo
+
+Streams live normalmente não são seekable. Quando um player entra novamente no raio, ele abre o ponto atual disponibilizado pelo stream. Arquivos normais seekable tentam sincronizar usando o timestamp mantido pelo servidor.
+
+## Segurança
+
+A forma recomendada de controlar áudio compartilhado é por **exports server-side**.
+
+Eventos client -> server que criam som continuam existindo para compatibilidade, mas:
+
+- sem permissão especial, o som fica restrito ao próprio player;
+- um client só pode controlar sons que ele próprio criou;
+- um client não pode sobrescrever um ID pertencente a outro som;
+- broadcast vindo do client exige ACE `pr_3dsound.broadcast`.
+
+Para habilitar broadcast client-side somente para um administrador/testador:
+
+```cfg
+add_ace identifier.license:SUA_LICENSE pr_3dsound.broadcast allow
+```
+
+Não conceda essa ACE para jogadores comuns.
+
+## Comandos de teste
+
+`client/test_commands.lua` continua incluído no pacote, mas está comentado no `fxmanifest.lua`.
+
+Para testar temporariamente:
+
+1. descomente `client/test_commands.lua`;
+2. conceda `pr_3dsound.broadcast` ao seu player se quiser que os testes transmitam para outros players;
+3. reinicie a resource;
+4. desabilite novamente em produção.
+
+## Observações
+
+- Attach em veículos/objects/peds usa `Network ID`.
+- O client atualiza a posição do `PannerNode` conforme a entity se move.
+- Emitters attachados respeitam o routing bucket da entity quando essa informação está disponível no servidor.
+- A atenuação de distância continua calculada no Lua; o `PannerNode` é usado principalmente para espacialização HRTF, evitando dupla atenuação.

@@ -1,5 +1,5 @@
 /**
- * pr_3dsound — listener.js  v3.0
+ * pr_3dsound — listener.js  v4.0
  * Recebe todas as mensagens NUI vindas do client.lua e delega ao SoundPlayer.
  */
 
@@ -16,7 +16,7 @@ window.addEventListener('message', function (event) {
 
         // ── Arquivo local ──────────────────────────────────────────────────────
         case 'play':
-            sp.play(i, d.file, d.volume, d.pos || null, d.loop || false);
+            sp.play(i, d.file, d.volume, d.pos || null, d.loop || false, d.is2D || false, d.options || {});
             break;
 
         // ── URL 2D (stream / YouTube / SoundCloud) ────────────────────────────

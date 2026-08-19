@@ -1,5 +1,5 @@
 --[[
-    pr_3dsound — client.lua  v3.8
+    pr_3dsound — client.lua  v4.0
     ─────────────────────────────────────────────────────────────────────────────
     EXPORTS client-side (use em outros scripts client-side):
       exports['pr_3dsound']:SoundExists(uniqueId)   → bool
@@ -245,12 +245,12 @@ local function startLoop()
     if emittersActive > 0 then return end
     emittersActive = 1
     Citizen.CreateThread(function()
-        local ped          = PlayerPedId()
         local raycastTimer = {}
         local smoothedMult = {}
 
         while emittersActive > 0 do
             emittersActive = 0
+            local ped           = PlayerPedId()
             local groundCoords  = GetEntityCoords(ped)
             local headCoords    = getHeadCoords(ped)
             local camDir        = rot_to_direction(GetGameplayCamRot(0))
@@ -280,14 +280,25 @@ local function startLoop()
                 if v and v.playing and not v.is2D then
                     emittersActive = emittersActive + 1
 
-                    -- Auto-update coords para attachs
+                    -- Auto-update coords para attachs. Se o entity ainda nao estava
+                    -- streamado quando o som chegou, tenta resolver o netId novamente.
+                    if (not v.attachEntity or not DoesEntityExist(v.attachEntity)) and v.attachNetId then
+                        local candidate = NetToEnt(v.attachNetId)
+                        if candidate and candidate ~= 0 and DoesEntityExist(candidate) then
+                            v.attachEntity = candidate
+                        end
+                    end
+
                     if v.attachEntity and DoesEntityExist(v.attachEntity) then
-                        local ec = GetEntityCoords(v.attachEntity)
+                        local ec
                         if v.attachOffset then
                             local off = v.attachOffset
-                            ec = vector3(ec.x + off.x, ec.y + off.y, ec.z + off.z)
+                            ec = GetOffsetFromEntityInWorldCoords(v.attachEntity, off.x or 0.0, off.y or 0.0, off.z or 0.0)
+                        else
+                            ec = GetEntityCoords(v.attachEntity)
                         end
                         v.pos = { x = ec.x, y = ec.y, z = ec.z }
+                        SendNUIMessage({ type = 'updateCoords', soundIndex = k, pos = v.pos })
                     end
 
                     -- ③ Ray: cabeça do player → fonte; ignora veículo do player
@@ -328,7 +339,7 @@ local function startLoop()
                     SendNUIMessage({
                         type          = 'setFilter',
                         soundIndex    = k,
-                        freq          = 22050,
+                        freq          = math.floor(900 + (21150 * finalMult)),
                         occlusionMult = finalMult,
                     })
                 end
@@ -347,43 +358,52 @@ local function _registerSound(index, data)
     Sounds[index] = data
 end
 
-local function _doPlay(index, coords, soundName, volume, radius, uniqueId, loop)
+local function _doPlay(index, coords, soundName, volume, radius, uniqueId, loop, options)
+    options = options or {}
     _registerSound(index, {
         uniqueId = uniqueId, pos = coords, vol = volume, maxVol = volume, dist = radius,
         playing = true, paused = false, is2D = false, isUrl = false, loop = loop or false,
+        serverManaged = options.serverManaged == true, endToken = options.endToken,
     })
     local distVol = calcDistanceVolume(Sounds[index], GetEntityCoords(PlayerPedId()))
-    SendNUIMessage({ type = 'play', soundIndex = index, file = soundName, volume = distVol, pos = coords, loop = loop or false })
+    SendNUIMessage({ type = 'play', soundIndex = index, file = soundName, volume = distVol, pos = coords, loop = loop or false, options = options })
+    if options.startTime and options.startTime > 0 then
+        SendNUIMessage({ type = 'setTimestamp', soundIndex = index, time = options.startTime })
+    end
     startLoop()
     return uniqueId
 end
 
-local function _doPlayUrl(index, name, url, volume, loop)
+local function _doPlayUrl(index, name, url, volume, loop, options)
+    options = options or {}
     _registerSound(index, {
         uniqueId = name, vol = volume, maxVol = volume,
         playing = true, paused = false, is2D = true, isUrl = true, loop = loop or false, url = url,
+        serverManaged = options.serverManaged == true, endToken = options.endToken,
     })
-    SendNUIMessage({ type = 'playUrl', soundIndex = index, url = url, volume = volume, loop = loop or false, options = {} })
+    SendNUIMessage({ type = 'playUrl', soundIndex = index, url = url, volume = volume, loop = loop or false, options = options })
     return name
 end
 
-local function _doPlayUrlPos(index, name, url, volume, coords, radius, loop, attachData)
-    local entity, offset = nil, nil
+local function _doPlayUrlPos(index, name, url, volume, coords, radius, loop, attachData, options)
+    options = options or {}
+    local entity, offset, attachNetId = nil, nil, nil
     if attachData then
-        entity = NetToEnt(attachData.entityNetId)
+        attachNetId = attachData.entityNetId
+        entity = NetToEnt(attachNetId)
         offset = attachData.offset or { x = 0, y = 0, z = 0 }
-        if not DoesEntityExist(entity) then
-            print('[pr_3dsound] WARN: attachEntity não encontrado, netId=' .. tostring(attachData.entityNetId))
-            entity = nil
+        if not entity or entity == 0 or not DoesEntityExist(entity) then
+            entity = nil -- o loop tenta resolver novamente quando o entity streamar
         end
     end
     _registerSound(index, {
         uniqueId = name, pos = coords, vol = volume, maxVol = volume, dist = radius,
         playing = true, paused = false, is2D = false, isUrl = true, loop = loop or false, url = url,
-        attachEntity = entity, attachOffset = offset,
+        attachEntity = entity, attachNetId = attachNetId, attachOffset = offset,
+        serverManaged = options.serverManaged == true, endToken = options.endToken,
     })
     local distVol = calcDistanceVolume(Sounds[index], GetEntityCoords(PlayerPedId()))
-    SendNUIMessage({ type = 'playUrlPos', soundIndex = index, url = url, volume = distVol, pos = coords, loop = loop or false, options = {} })
+    SendNUIMessage({ type = 'playUrlPos', soundIndex = index, url = url, volume = distVol, pos = coords, loop = loop or false, options = options })
     startLoop()
     return name
 end
@@ -393,18 +413,18 @@ end
 -- =============================================
 
 RegisterNetEvent('pr_3dsound:client:play')
-AddEventHandler('pr_3dsound:client:play', function(index, coords, soundName, volume, radius, uniqueId, loop, attachData)
-    _doPlay(index, coords, soundName, volume, radius, uniqueId, loop)
+AddEventHandler('pr_3dsound:client:play', function(index, coords, soundName, volume, radius, uniqueId, loop, attachData, options)
+    _doPlay(index, coords, soundName, volume, radius, uniqueId, loop, options)
 end)
 
 RegisterNetEvent('pr_3dsound:client:playUrl')
 AddEventHandler('pr_3dsound:client:playUrl', function(index, name, url, volume, loop, options)
-    _doPlayUrl(index, name, url, volume, loop)
+    _doPlayUrl(index, name, url, volume, loop, options)
 end)
 
 RegisterNetEvent('pr_3dsound:client:playUrlPos')
 AddEventHandler('pr_3dsound:client:playUrlPos', function(index, name, url, volume, coords, radius, loop, options, attachData)
-    _doPlayUrlPos(index, name, url, volume, coords, radius, loop, attachData)
+    _doPlayUrlPos(index, name, url, volume, coords, radius, loop, attachData, options)
 end)
 
 RegisterNetEvent('pr_3dsound:client:attachToEntity')
@@ -416,6 +436,7 @@ AddEventHandler('pr_3dsound:client:attachToEntity', function(index, entityNetId,
         local entity = NetToEnt(entityNetId)
         if DoesEntityExist(entity) then
             Sounds[index].attachEntity = entity
+            Sounds[index].attachNetId = entityNetId
             Sounds[index].attachOffset = offset or { x = 0, y = 0, z = 0 }
         elseif attempts > 0 then
             Citizen.SetTimeout(500, function() tryAttach(attempts - 1) end)
@@ -431,6 +452,7 @@ RegisterNetEvent('pr_3dsound:client:detachEntity')
 AddEventHandler('pr_3dsound:client:detachEntity', function(index)
     if not Sounds[index] then return end
     Sounds[index].attachEntity = nil
+    Sounds[index].attachNetId = nil
     Sounds[index].attachOffset = nil
 end)
 
@@ -468,6 +490,7 @@ RegisterNetEvent('pr_3dsound:client:setVolume')
 AddEventHandler('pr_3dsound:client:setVolume', function(index, volume)
     if not Sounds[index] then return end
     Sounds[index].vol = clamp(volume, 0.0, 1.0)
+    Sounds[index].maxVol = Sounds[index].vol
     SendNUIMessage({ type = 'setVolume', soundIndex = index, volume = Sounds[index].vol })
 end)
 
@@ -516,7 +539,14 @@ end)
 
 RegisterNUICallback('soundEnded', function(data, cb)
     local index = data.index
-    if Sounds[index] then Sounds[index].playing = false; Sounds[index] = nil end
+    local sound = Sounds[index]
+    if sound then
+        if sound.serverManaged and sound.endToken and sound.uniqueId then
+            TriggerServerEvent('pr_3dsound:server:soundEnded', sound.uniqueId, sound.endToken)
+        end
+        sound.playing = false
+        Sounds[index] = nil
+    end
     cb('ok')
 end)
 
@@ -572,11 +602,23 @@ exports('PlayLocal', function(file, volume, radius, loop)
     return id
 end)
 
+exports('PlayLocal2D', function(file, volume, loop)
+    local id    = genId()
+    local index = 1
+    while Sounds[index] do index = index + 1 end
+    _registerSound(index, {
+        uniqueId = id, vol = volume or 1.0, maxVol = volume or 1.0,
+        playing = true, paused = false, is2D = true, isUrl = false, loop = loop or false,
+    })
+    SendNUIMessage({ type = 'play', soundIndex = index, file = file, volume = volume or 1.0, is2D = true, loop = loop or false })
+    return id
+end)
+
 exports('PlayUrl2D', function(url, volume, loop)
     local id    = genId()
     local index = 1
     while Sounds[index] do index = index + 1 end
-    _doPlayUrl(index, id, url, volume or 1.0, loop or false)
+    _doPlayUrl(index, id, url, volume or 1.0, loop or false, nil)
     return id
 end)
 
@@ -586,7 +628,7 @@ exports('PlayUrl3D', function(url, volume, radius, loop)
     local id     = genId()
     local index  = 1
     while Sounds[index] do index = index + 1 end
-    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 50.0, loop or false, nil)
+    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 50.0, loop or false, nil, nil)
     return id
 end)
 
@@ -597,7 +639,7 @@ exports('PlayAttached', function(url, volume, entityNetId, radius, loop)
     local index  = 1
     while Sounds[index] do index = index + 1 end
     local attachData = { entityNetId = entityNetId, offset = { x = 0, y = 0, z = 0 } }
-    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 30.0, (loop == nil) and true or loop, attachData)
+    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 30.0, (loop == nil) and true or loop, attachData, nil)
     return id
 end)
 
@@ -632,6 +674,7 @@ exports('SetVolume', function(uniqueId, volume)
     local k, v = findSoundByUniqueId(uniqueId)
     if not k or not v then return false end
     v.vol = clamp(volume, 0.0, 1.0)
+    v.maxVol = v.vol
     SendNUIMessage({ type = 'setVolume', soundIndex = k, volume = v.vol })
     return true
 end)
@@ -656,4 +699,10 @@ exports('FadeOut', function(uniqueId, duration)
     if not k then return false end
     SendNUIMessage({ type = 'fadeOut', soundIndex = k, duration = duration or 1000 })
     return true
+end)
+
+
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName ~= GetCurrentResourceName() then return end
+    SendNUIMessage({ type = 'stopAll' })
 end)
