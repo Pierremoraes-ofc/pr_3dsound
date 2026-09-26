@@ -1,5 +1,5 @@
 /**
- * pr_3dsound — listener.js  v4.0
+ * pr_3dsound — listener.js  v4.0.0-fixed
  * Recebe todas as mensagens NUI vindas do client.lua e delega ao SoundPlayer.
  */
 
@@ -44,6 +44,8 @@ window.addEventListener('message', function (event) {
         // ── Controles básicos ─────────────────────────────────────────────────
         case 'pause':           sp.pause(i);                              break;
         case 'resume':          sp.resume(i);                             break;
+        case 'pauseAt':         sp.pauseAt(i, d.time);                    break;
+        case 'resumeAt':        sp.resumeAt(i, d.time);                   break;
         case 'stop':            sp.stop(i);                               break;
         case 'updateCoords':    sp.updateCoords(i, d.pos);                break;
 
@@ -67,3 +69,10 @@ window.addEventListener('message', function (event) {
             console.warn('[pr_3dsound] Mensagem desconhecida:', d.type);
     }
 });
+
+
+// Confirma que o listener NUI está pronto; o client reenvia regras HTTP que
+// podem ter chegado antes do carregamento completo da página.
+setTimeout(function () {
+    $.post('http://pr_3dsound/ready', JSON.stringify({}));
+}, 0);

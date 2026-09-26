@@ -1,5 +1,5 @@
 --[[
-    pr_3dsound — client.lua  v4.0
+    pr_3dsound — client.lua  v4.0.0-fixed
     ─────────────────────────────────────────────────────────────────────────────
     EXPORTS client-side (use em outros scripts client-side):
       exports['pr_3dsound']:SoundExists(uniqueId)   → bool
@@ -22,6 +22,12 @@
 
 local Sounds         = {}
 local emittersActive = 0
+local VolumeGroups   = {} -- [uniqueId prefix] = multiplicador local 0..1
+local PR3D_DEBUG = GetConvarInt('pr_3dsound_debug', 0) == 1
+
+local function debugLog(message)
+    if PR3D_DEBUG then print('[pr_3dsound/debug] ' .. tostring(message)) end
+end
 
 -- =============================================
 --  CONFIG
@@ -32,7 +38,7 @@ local CFG = {
     RAYCAST_ENABLED     = true,
     RAYCAST_INTERVAL_MS = 400,
     RAYCAST_SMOOTH      = 0.72,
-    RAYCAST_FLAGS       = 1 + 2 + 8,   -- mundo + veículos + objetos
+    RAYCAST_FLAGS       = 1 + 8,       -- mundo + objetos; veículos têm oclusão dedicada abaixo
     WALL_MULT           = 0.20,         -- parede grossa
     WALL_THIN_MULT      = 0.50,         -- parede fina / veículo alheio
 
@@ -41,12 +47,14 @@ local CFG = {
     VEHWINDOW_MULT      = 0.35,         -- janela quebrada/aberta (sem porta aberta)
     VEHOPEN1_MULT       = 0.60,         -- 1 porta aberta
     VEHOPEN2_MULT       = 0.70,         -- 2 portas abertas
+    VEHTRUNK_MULT       = 1.00,         -- porta-malas aberto: som livre para quem está fora
     -- 3+ portas → 1.0 (definido no código)
 
     -- ── Veículo do player (player dentro ouvindo sons externos) ──────────
     VEHCLOSED_PLAYER_MULT  = 0.15,
     VEHWINDOW_PLAYER_MULT  = 0.50,
     VEHOPEN_PLAYER_MULT    = 0.85,
+    VEHICLE_TO_VEHICLE_MIN = 0.25, -- evita som praticamente mudo entre dois carros fechados
 
     -- ── Portal MLO ────────────────────────────────────────────────────────
     MLO_ENABLED         = true,
@@ -68,10 +76,24 @@ local function clamp(v, lo, hi)
     return math.max(lo, math.min(hi, v))
 end
 
+local function getVolumeGroupMultiplier(uniqueId)
+    if type(uniqueId) ~= 'string' then return 1.0 end
+    local bestLen, mult = -1, 1.0
+    for prefix, value in pairs(VolumeGroups) do
+        if uniqueId:sub(1, #prefix) == prefix and #prefix > bestLen then
+            bestLen = #prefix
+            mult = value
+        end
+    end
+    return clamp(mult, 0.0, 1.0)
+end
+
 local function calcDistanceVolume(s, coords)
+    if not s or not s.pos then return 0.0 end
+    local maxVol = (s.maxVol or s.vol or 1.0) * getVolumeGroupMultiplier(s.uniqueId)
+    local radius = math.max(0.01, s.dist or 30.0)
     local dist = #(coords - vector3(s.pos.x, s.pos.y, s.pos.z))
-    local mult = (s.maxVol or s.vol) / (s.dist or 30.0)
-    return clamp((s.maxVol or s.vol) - (dist * mult), 0.0, 1.0)
+    return clamp(maxVol - (dist * (maxVol / radius)), 0.0, 1.0)
 end
 
 local function snapshotSoundKeys()
@@ -156,7 +178,13 @@ local function getSourceVehicleMult(soundEntry, ped)
     -- Player dentro do veículo da fonte → sem oclusão
     if GetVehiclePedIsIn(ped, false) == vehicle then return 1.0 end
 
-    -- Conta portas abertas (índices 0-3; ignora capo=4 e traseira=5+)
+    -- Porta-malas aberto libera o som para o exterior. Não se aplica para
+    -- quem está dentro: esse caso já retorna acima sem oclusão.
+    if GetVehicleDoorAngleRatio(vehicle, 5) > 0.05 then
+        return CFG.VEHTRUNK_MULT
+    end
+
+    -- Conta portas laterais abertas (índices 0-3; ignora capô=4).
     local openDoors = 0
     for i = 0, 3 do
         if GetVehicleDoorAngleRatio(vehicle, i) > 0.05 then
@@ -207,6 +235,18 @@ local function getPlayerVehicleMult(ped)
         return CFG.VEHCLOSED_PLAYER_MULT
     end
     return CFG.VEHWINDOW_PLAYER_MULT
+end
+
+local function combineVehicleOcclusion(sourceVehicle, playerVehicle, sourceMult, playerMult)
+    local combined = sourceMult * playerMult
+
+    -- Multiplicar duas cabines fechadas resultava em 0.15 * 0.15 = 0.0225,
+    -- tornando outro carro inaudível. Mantém a oclusão, mas com piso audível.
+    if sourceVehicle and playerVehicle ~= 0 and sourceVehicle ~= playerVehicle then
+        combined = math.max(combined, CFG.VEHICLE_TO_VEHICLE_MIN)
+    end
+
+    return combined
 end
 
 -- =============================================
@@ -280,32 +320,48 @@ local function startLoop()
                 if v and v.playing and not v.is2D then
                     emittersActive = emittersActive + 1
 
-                    -- Auto-update coords para attachs. Se o entity ainda nao estava
-                    -- streamado quando o som chegou, tenta resolver o netId novamente.
-                    if (not v.attachEntity or not DoesEntityExist(v.attachEntity)) and v.attachNetId then
-                        local candidate = NetToEnt(v.attachNetId)
-                        if candidate and candidate ~= 0 and DoesEntityExist(candidate) then
-                            v.attachEntity = candidate
+                    -- O Network ID pode chegar antes da entity entrar no scope do OneSync.
+                    -- Mantemos o netId e tentamos resolver novamente durante o loop.
+                    if v.attachNetId and (not v.attachEntity or not DoesEntityExist(v.attachEntity)) then
+                        local entity = NetToEnt(v.attachNetId)
+                        if entity and entity ~= 0 and DoesEntityExist(entity) then
+                            v.attachEntity = entity
                         end
                     end
 
                     if v.attachEntity and DoesEntityExist(v.attachEntity) then
-                        local ec
+                        local ec = GetEntityCoords(v.attachEntity)
                         if v.attachOffset then
                             local off = v.attachOffset
-                            ec = GetOffsetFromEntityInWorldCoords(v.attachEntity, off.x or 0.0, off.y or 0.0, off.z or 0.0)
-                        else
-                            ec = GetEntityCoords(v.attachEntity)
+                            ec = vector3(ec.x + off.x, ec.y + off.y, ec.z + off.z)
                         end
                         v.pos = { x = ec.x, y = ec.y, z = ec.z }
-                        SendNUIMessage({ type = 'updateCoords', soundIndex = k, pos = v.pos })
+
+                        -- A v3.x atualizava distância/oclusão no Lua, mas não movia o
+                        -- PannerNode no NUI. Agora o spatial acompanha a entity de verdade.
+                        local last = v.lastNuiPos
+                        if not last or math.abs(last.x - ec.x) > 0.02 or math.abs(last.y - ec.y) > 0.02 or math.abs(last.z - ec.z) > 0.02 then
+                            v.lastNuiPos = { x = ec.x, y = ec.y, z = ec.z }
+                            SendNUIMessage({
+                                type = 'updateCoords',
+                                soundIndex = k,
+                                pos = v.pos,
+                            })
+                        end
                     end
 
+                    if v.pos then
                     -- ③ Ray: cabeça do player → fonte; ignora veículo do player
                     raycastTimer[k] = raycastTimer[k] or 0
                     if CFG.RAYCAST_ENABLED and (now - raycastTimer[k]) >= CFG.RAYCAST_INTERVAL_MS then
                         raycastTimer[k] = now
-                        local ignoreEnt = playerVehicle ~= 0 and playerVehicle or ped
+                        -- Ignora veículo emissor no raycast: sua própria lataria não
+                        -- pode reabafar áudio que a oclusão de portas já calculou.
+                        local attachedVehicle = v.attachEntity
+                            and DoesEntityExist(v.attachEntity)
+                            and GetEntityType(v.attachEntity) == 2
+                            and v.attachEntity or nil
+                        local ignoreEnt = attachedVehicle or (playerVehicle ~= 0 and playerVehicle or ped)
                         launchRay(k, headCoords, v.pos, ignoreEnt)
                     end
 
@@ -318,13 +374,16 @@ local function startLoop()
 
                     local sourceVehMult       = playerInsideSource and 1.0 or getSourceVehicleMult(v, ped)
                     local effectivePlayerMult = playerInsideSource and 1.0 or playerVehMult
+                    local vehicleMult         = combineVehicleOcclusion(
+                        sourceVehicle, playerVehicle, sourceVehMult, effectivePlayerMult
+                    )
 
                     -- ⑤ MLO
                     local mloMult = getMloMult(groundCoords, v.pos)
 
                     -- ⑥ Multiplicador final
                     local rayMult   = smoothedMult[k] or 1.0
-                    local finalMult = clamp(rayMult * mloMult * sourceVehMult * effectivePlayerMult, 0.0, 1.0)
+                    local finalMult = clamp(rayMult * mloMult * vehicleMult, 0.0, 1.0)
 
                     -- ⑦ Envia ao NUI
                     local distVol = calcDistanceVolume(v, groundCoords)
@@ -339,14 +398,28 @@ local function startLoop()
                     SendNUIMessage({
                         type          = 'setFilter',
                         soundIndex    = k,
-                        freq          = math.floor(900 + (21150 * finalMult)),
+                        -- URLs diretas 3D usam low-pass real no WebAudio.
+                        freq          = 700 + (21350 * finalMult),
                         occlusionMult = finalMult,
                     })
+                    end -- v.pos
                 end
             end
 
             Citizen.Wait(emittersActive > 8 and 100 or 250)
         end
+    end)
+end
+
+local function sendUrlPlayPrepared(index, uniqueId, url, payload, startSpatial)
+    CreateThread(function()
+        if not Sounds[index] then return end
+
+        payload.options = payload.options or {}
+        payload.options.paused = Sounds[index].paused == true
+
+        SendNUIMessage(payload)
+        if startSpatial and not Sounds[index].paused then startLoop() end
     end)
 end
 
@@ -362,15 +435,15 @@ local function _doPlay(index, coords, soundName, volume, radius, uniqueId, loop,
     options = options or {}
     _registerSound(index, {
         uniqueId = uniqueId, pos = coords, vol = volume, maxVol = volume, dist = radius,
-        playing = true, paused = false, is2D = false, isUrl = false, loop = loop or false,
-        serverManaged = options.serverManaged == true, endToken = options.endToken,
+        playing = not options.paused, paused = options.paused == true, is2D = false, isUrl = false, loop = loop or false,
+        serverManaged = options.serverManaged == true,
     })
     local distVol = calcDistanceVolume(Sounds[index], GetEntityCoords(PlayerPedId()))
-    SendNUIMessage({ type = 'play', soundIndex = index, file = soundName, volume = distVol, pos = coords, loop = loop or false, options = options })
-    if options.startTime and options.startTime > 0 then
-        SendNUIMessage({ type = 'setTimestamp', soundIndex = index, time = options.startTime })
-    end
-    startLoop()
+    SendNUIMessage({
+        type = 'play', soundIndex = index, file = soundName, volume = distVol,
+        pos = coords, loop = loop or false, options = options
+    })
+    if not options.paused then startLoop() end
     return uniqueId
 end
 
@@ -378,33 +451,63 @@ local function _doPlayUrl(index, name, url, volume, loop, options)
     options = options or {}
     _registerSound(index, {
         uniqueId = name, vol = volume, maxVol = volume,
-        playing = true, paused = false, is2D = true, isUrl = true, loop = loop or false, url = url,
-        serverManaged = options.serverManaged == true, endToken = options.endToken,
+        playing = not options.paused, paused = options.paused == true,
+        is2D = true, isUrl = true, loop = loop or false, url = url,
+        serverManaged = options.serverManaged == true,
     })
-    SendNUIMessage({ type = 'playUrl', soundIndex = index, url = url, volume = volume, loop = loop or false, options = options })
+    sendUrlPlayPrepared(index, name, url, {
+        type = 'playUrl', soundIndex = index, url = url, volume = volume,
+        loop = loop or false, options = options
+    }, false)
     return name
 end
 
 local function _doPlayUrlPos(index, name, url, volume, coords, radius, loop, attachData, options)
     options = options or {}
     local entity, offset, attachNetId = nil, nil, nil
+
     if attachData then
-        attachNetId = attachData.entityNetId
-        entity = NetToEnt(attachNetId)
+        attachNetId = tonumber(attachData.entityNetId)
         offset = attachData.offset or { x = 0, y = 0, z = 0 }
-        if not entity or entity == 0 or not DoesEntityExist(entity) then
-            entity = nil -- o loop tenta resolver novamente quando o entity streamar
+        if attachNetId then
+            local candidate = NetToEnt(attachNetId)
+            if candidate and candidate ~= 0 and DoesEntityExist(candidate) then entity = candidate end
         end
     end
+
     _registerSound(index, {
         uniqueId = name, pos = coords, vol = volume, maxVol = volume, dist = radius,
-        playing = true, paused = false, is2D = false, isUrl = true, loop = loop or false, url = url,
+        playing = not options.paused, paused = options.paused == true,
+        is2D = false, isUrl = true, loop = loop or false, url = url,
         attachEntity = entity, attachNetId = attachNetId, attachOffset = offset,
-        serverManaged = options.serverManaged == true, endToken = options.endToken,
+        serverManaged = options.serverManaged == true,
     })
-    local distVol = calcDistanceVolume(Sounds[index], GetEntityCoords(PlayerPedId()))
-    SendNUIMessage({ type = 'playUrlPos', soundIndex = index, url = url, volume = distVol, pos = coords, loop = loop or false, options = options })
-    startLoop()
+
+    local ped = PlayerPedId()
+    local playerCoords = GetEntityCoords(ped)
+    local distVol = calcDistanceVolume(Sounds[index], playerCoords)
+
+    -- O NUI precisa conhecer duas coisas diferentes: o teto real do emitter e o
+    -- volume audível neste instante. Antes usávamos o volume já atenuado como
+    -- maxVol, então o player ficava com um teto incorreto depois de stream-in.
+    local playerVehicle = GetVehiclePedIsIn(ped, false)
+    local sourceVehicle = entity and DoesEntityExist(entity) and GetEntityType(entity) == 2 and entity or nil
+    local playerInsideSource = sourceVehicle and playerVehicle == sourceVehicle
+    local sourceVehMult = playerInsideSource and 1.0 or getSourceVehicleMult(Sounds[index], ped)
+    local playerVehMult = playerInsideSource and 1.0 or getPlayerVehicleMult(ped)
+    local vehicleMult = combineVehicleOcclusion(sourceVehicle, playerVehicle, sourceVehMult, playerVehMult)
+    local mloMult = getMloMult(playerCoords, Sounds[index].pos)
+    local initialOcclusion = clamp(vehicleMult * mloMult, 0.0, 1.0)
+    local initialVolume = distVol * initialOcclusion
+
+    options.maxVolume = volume
+    options.initialDistVolume = distVol
+    options.initialOcclusionMult = initialOcclusion
+
+    sendUrlPlayPrepared(index, name, url, {
+        type = 'playUrlPos', soundIndex = index, url = url, volume = initialVolume,
+        pos = coords, loop = loop or false, options = options
+    }, true)
     return name
 end
 
@@ -471,6 +574,24 @@ AddEventHandler('pr_3dsound:client:resume', function(index)
     startLoop()
 end)
 
+
+-- Controles atômicos usados pelo Lafy/HLS: o timestamp e o play/pause chegam
+-- na mesma mensagem NUI, evitando corrida entre setTimestamp e resume.
+RegisterNetEvent('pr_3dsound:client:pauseAt')
+AddEventHandler('pr_3dsound:client:pauseAt', function(index, time)
+    if not Sounds[index] then return end
+    Sounds[index].playing = false; Sounds[index].paused = true
+    SendNUIMessage({ type = 'pauseAt', soundIndex = index, time = tonumber(time) or 0.0 })
+end)
+
+RegisterNetEvent('pr_3dsound:client:resumeAt')
+AddEventHandler('pr_3dsound:client:resumeAt', function(index, time)
+    if not Sounds[index] then return end
+    Sounds[index].playing = true; Sounds[index].paused = false
+    SendNUIMessage({ type = 'resumeAt', soundIndex = index, time = tonumber(time) or 0.0 })
+    startLoop()
+end)
+
 RegisterNetEvent('pr_3dsound:client:stop')
 AddEventHandler('pr_3dsound:client:stop', function(index)
     if not Sounds[index] then return end
@@ -488,10 +609,27 @@ end)
 
 RegisterNetEvent('pr_3dsound:client:setVolume')
 AddEventHandler('pr_3dsound:client:setVolume', function(index, volume)
-    if not Sounds[index] then return end
-    Sounds[index].vol = clamp(volume, 0.0, 1.0)
-    Sounds[index].maxVol = Sounds[index].vol
-    SendNUIMessage({ type = 'setVolume', soundIndex = index, volume = Sounds[index].vol })
+    local sound = Sounds[index]
+    if not sound then return end
+    sound.vol = clamp(volume, 0.0, 1.0)
+    sound.maxVol = sound.vol
+
+    -- Em som 3D nunca injete o volume bruto no NUI: o próximo tick aplicaria
+    -- distância/oclusão e criaria o efeito "alto por um instante e depois baixo".
+    if not sound.is2D and sound.pos then
+        local coords = GetEntityCoords(PlayerPedId())
+        -- Atualiza primeiro o teto bruto; updateVolume aplica distância + oclusão
+        -- já existentes sem tocar por um frame em volume cheio.
+        SendNUIMessage({ type = 'setVolumeMax', soundIndex = index, volume = sound.maxVol })
+        SendNUIMessage({
+            type = 'updateVolume',
+            soundIndex = index,
+            volume = calcDistanceVolume(sound, coords),
+            playerPos = { x = coords.x, y = coords.y, z = coords.z },
+        })
+    else
+        SendNUIMessage({ type = 'setVolume', soundIndex = index, volume = sound.vol })
+    end
 end)
 
 RegisterNetEvent('pr_3dsound:client:setVolumeMax')
@@ -524,7 +662,9 @@ end)
 RegisterNetEvent('pr_3dsound:client:fadeIn')
 AddEventHandler('pr_3dsound:client:fadeIn', function(index, duration, targetVolume)
     if not Sounds[index] then return end
-    SendNUIMessage({ type = 'fadeIn', soundIndex = index, duration = duration, volume = targetVolume })
+    Sounds[index].vol = clamp(targetVolume or 1.0, 0.0, 1.0)
+    Sounds[index].maxVol = Sounds[index].vol
+    SendNUIMessage({ type = 'fadeIn', soundIndex = index, duration = duration, volume = Sounds[index].vol })
 end)
 
 RegisterNetEvent('pr_3dsound:client:fadeOut')
@@ -541,18 +681,49 @@ RegisterNUICallback('soundEnded', function(data, cb)
     local index = data.index
     local sound = Sounds[index]
     if sound then
-        if sound.serverManaged and sound.endToken and sound.uniqueId then
-            TriggerServerEvent('pr_3dsound:server:soundEnded', sound.uniqueId, sound.endToken)
-        end
         sound.playing = false
+        if sound.serverManaged then
+            TriggerServerEvent('pr_3dsound:server:soundEnded', index)
+        end
         Sounds[index] = nil
     end
     cb('ok')
 end)
 
+RegisterNUICallback('soundError', function(data, cb)
+    local index = tonumber(data and data.index)
+    local sound = index and Sounds[index] or nil
+    if sound then
+        sound.playing = false
+        if sound.serverManaged then
+            TriggerServerEvent('pr_3dsound:server:soundError', index, tostring(data.reason or 'Falha ao reproduzir o stream.'))
+        end
+        Sounds[index] = nil
+    end
+    cb('ok')
+end)
+
+-- Re-sincroniza emitters persistentes ao entrar ou reiniciar a resource.
+CreateThread(function()
+    Wait(1500)
+    TriggerServerEvent('pr_3dsound:server:requestSync')
+end)
+
 RegisterNUICallback('getInfo', function(data, cb)
     if not Sounds[data.index] then cb(nil); return end
     cb(Sounds[data.index])
+end)
+
+-- Multiplicador local por prefixo de uniqueId. Não altera o estado autoritativo
+-- do servidor; serve para preferências individuais de audição (ex.: Lafy mute).
+RegisterNetEvent('pr_3dsound:client:setGroupVolume')
+AddEventHandler('pr_3dsound:client:setGroupVolume', function(prefix, volume)
+    if type(prefix) ~= 'string' or prefix == '' then return end
+    VolumeGroups[prefix] = clamp(tonumber(volume) or 1.0, 0.0, 1.0)
+end)
+
+RegisterNUICallback('ready', function(_, cb)
+    cb({ ok = true })
 end)
 
 -- =============================================
@@ -618,7 +789,7 @@ exports('PlayUrl2D', function(url, volume, loop)
     local id    = genId()
     local index = 1
     while Sounds[index] do index = index + 1 end
-    _doPlayUrl(index, id, url, volume or 1.0, loop or false, nil)
+    _doPlayUrl(index, id, url, volume or 1.0, loop or false)
     return id
 end)
 
@@ -628,7 +799,7 @@ exports('PlayUrl3D', function(url, volume, radius, loop)
     local id     = genId()
     local index  = 1
     while Sounds[index] do index = index + 1 end
-    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 50.0, loop or false, nil, nil)
+    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 50.0, loop or false, nil)
     return id
 end)
 
@@ -639,7 +810,7 @@ exports('PlayAttached', function(url, volume, entityNetId, radius, loop)
     local index  = 1
     while Sounds[index] do index = index + 1 end
     local attachData = { entityNetId = entityNetId, offset = { x = 0, y = 0, z = 0 } }
-    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 30.0, (loop == nil) and true or loop, attachData, nil)
+    _doPlayUrlPos(index, id, url, volume or 1.0, coords, radius or 30.0, (loop == nil) and true or loop, attachData)
     return id
 end)
 
@@ -699,10 +870,4 @@ exports('FadeOut', function(uniqueId, duration)
     if not k then return false end
     SendNUIMessage({ type = 'fadeOut', soundIndex = k, duration = duration or 1000 })
     return true
-end)
-
-
-AddEventHandler('onResourceStop', function(resourceName)
-    if resourceName ~= GetCurrentResourceName() then return end
-    SendNUIMessage({ type = 'stopAll' })
 end)

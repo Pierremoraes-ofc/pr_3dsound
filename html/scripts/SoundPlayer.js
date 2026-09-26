@@ -1,343 +1,185 @@
 /**
- * pr_3dsound — SoundPlayer.js v4.0
+ * pr_3dsound — SoundPlayer.js  v4.1.0-hls
  *
- * Direct HTTP(S) positional audio now uses an HTMLMediaElement routed through
- * the Web Audio API: MediaElementSource -> PannerNode(HRTF) -> BiquadFilter -> Gain.
- * This gives true left/right/front/back spatialization for direct URLs while
- * still allowing progressive/live media. The remote host MUST allow CORS.
- * If CORS/media loading fails, it falls back to Howler HTML5 audio so playback
- * still works, but that fallback cannot provide true HRTF.
- *
- * YouTube and SoundCloud remain iframe/widget based. Browser isolation prevents
- * routing their decoded audio into our WebAudio graph, so they use distance and
- * occlusion volume only.
+ * Correções v3.2:
+ *   - AudioContext desbloqueado na inicialização → elimina delay/pausa no início
+ *   - Oclusão via multiplicador de volume (funciona para local, stream, YT e SC)
+ *     O filtro lowpass é salvo mas o volume é o efeito principal e mais confiável
+ *   - _lastDistVol salva o volume de distância limpo; setFilter multiplica por cima
+ *   - SoundCloud via Widget API (embed, sem client_id)
  */
 
 'use strict';
 
-var players = {};
-var ytReady = false;
-var ytQueue = [];
-var directCtx = null;
-
-function clamp(v, lo, hi) {
-    return Math.max(lo, Math.min(hi, Number(v) || 0));
-}
-
-function getDirectAudioContext() {
-    if (typeof Howler !== 'undefined' && Howler.ctx) return Howler.ctx;
-    if (directCtx) return directCtx;
-    var Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return null;
-    directCtx = new Ctx();
-    return directCtx;
-}
-
-function setContextListener(ctx, playerPos, camDir) {
-    if (!ctx || !ctx.listener) return;
-    var l = ctx.listener;
-    if (playerPos) {
-        if (l.positionX) {
-            setAudioParam(l.positionX, Number(playerPos.x) || 0, ctx);
-            setAudioParam(l.positionY, Number(playerPos.y) || 0, ctx);
-            setAudioParam(l.positionZ, Number(playerPos.z) || 0, ctx);
-        } else if (l.setPosition) {
-            l.setPosition(Number(playerPos.x) || 0, Number(playerPos.y) || 0, Number(playerPos.z) || 0);
-        }
-    }
-    if (camDir) {
-        if (l.forwardX) {
-            setAudioParam(l.forwardX, Number(camDir.x) || 0, ctx);
-            setAudioParam(l.forwardY, Number(camDir.y) || 1, ctx);
-            setAudioParam(l.forwardZ, Number(camDir.z) || 0, ctx);
-            setAudioParam(l.upX, 0, ctx);
-            setAudioParam(l.upY, 0, ctx);
-            setAudioParam(l.upZ, 1, ctx);
-        } else if (l.setOrientation) {
-            l.setOrientation(Number(camDir.x) || 0, Number(camDir.y) || 1, Number(camDir.z) || 0, 0, 0, 1);
-        }
-    }
-}
-
-function sanitize(value) {
-    if (typeof DOMPurify !== 'undefined' && DOMPurify.sanitize) return DOMPurify.sanitize(value);
-    return String(value || '');
-}
+// ─── Unlock do AudioContext ───────────────────────────────────────────────────
+// GTA V / CEF suspende o AudioContext por política de autoplay.
+// Fazemos resume() o mais cedo possível e repetimos se necessário.
 
 function tryUnlockCtx() {
-    var ctx = (typeof Howler !== 'undefined') ? Howler.ctx : null;
-    if (ctx && ctx.state !== 'running' && ctx.resume) ctx.resume().catch(function () {});
-    if (directCtx && directCtx.state !== 'running' && directCtx.resume) directCtx.resume().catch(function () {});
-    if (!ctx && !directCtx) setTimeout(tryUnlockCtx, 200);
+    var ctx = Howler.ctx;
+    if (!ctx) { setTimeout(tryUnlockCtx, 200); return; }
+    if (ctx.state !== 'running') {
+        ctx.resume().catch(function () {});
+    }
 }
 
 document.addEventListener('DOMContentLoaded', tryUnlockCtx);
+// Também tenta em qualquer interação (backup)
 ['click', 'keydown', 'touchstart', 'mousedown'].forEach(function (ev) {
     document.addEventListener(ev, tryUnlockCtx, { once: true });
 });
+// Tenta periodicamente até conseguir
 var _unlockInterval = setInterval(function () {
-    var ctx = (typeof Howler !== 'undefined') ? Howler.ctx : null;
+    var ctx = Howler.ctx;
     if (!ctx) return;
     if (ctx.state === 'running') { clearInterval(_unlockInterval); return; }
-    if (ctx.resume) ctx.resume().catch(function () {});
+    ctx.resume().catch(function () {});
 }, 500);
+
+// ─── Detecção de tipo de URL ──────────────────────────────────────────────────
 
 function detectUrlType(url) {
     if (!url) return 'local';
     if (/^https?:\/\//i.test(url)) {
         if (/youtube\.com\/watch|youtu\.be\//i.test(url)) return 'youtube';
-        if (/soundcloud\.com\//i.test(url)) return 'soundcloud';
+        if (/soundcloud\.com\//i.test(url))               return 'soundcloud';
         return 'stream';
     }
     return 'local';
 }
 
+function isHlsUrl(url) {
+    return /\.m3u8(?:$|[?#])/i.test(String(url || ''));
+}
+
 function extractYouTubeId(url) {
-    var m = String(url).match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+    var m = url.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/);
     return m ? m[1] : null;
 }
 
-function newPlayer(extra) {
-    return Object.assign({
-        vol: 1,
-        maxVol: 1,
-        playing: false,
-        paused: false,
-        loop: false,
-        pos: null,
-        dist: 50,
-        howl: null,
-        spatial: null,
-        ytPlayer: null,
-        scWidget: null,
-        _occlusionMult: 1.0,
-        _lastDistVol: 1.0,
-        _pendingSeek: null,
-    }, extra || {});
-}
+// ─── Registro de players ──────────────────────────────────────────────────────
+var players = {};
+var ytReady = false;
+var ytQueue = [];
 
-function setAudioParam(param, value, ctx) {
-    if (!param) return;
-    if (param.setValueAtTime) param.setValueAtTime(value, ctx.currentTime);
-    else param.value = value;
-}
+// ─── Oclusão por volume ───────────────────────────────────────────────────────
+//
+// A abordagem de filtro Web Audio (BiquadFilter por nó) é frágil no Howler
+// porque a API interna (_sounds, _node, _panner) não é estável entre versões
+// e varia entre html5:true (streams) e html5:false (local).
+//
+// Estratégia robusta e universal:
+//   - O Lua calcula distVolume e occlusionMult separadamente
+//   - updateVolume recebe distVolume e aplica: vol = distVol × occlusionMult
+//   - setFilter recebe freq (para visualização/debug) e occlusionMult
+//   - Para sons locais sem html5 também aplica o BiquadFilter quando possível
+//
+// Isso funciona para TODOS os tipos (local, stream, YT, SC).
 
-function setPannerPosition(panner, pos, ctx) {
-    if (!panner || !pos) return;
-    if (panner.positionX) {
-        setAudioParam(panner.positionX, Number(pos.x) || 0, ctx);
-        setAudioParam(panner.positionY, Number(pos.y) || 0, ctx);
-        setAudioParam(panner.positionZ, Number(pos.z) || 0, ctx);
-    } else if (panner.setPosition) {
-        panner.setPosition(Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0);
-    }
-}
+function writePlayerVolume(p, v) {
+    v = Math.max(0, Math.min(1, Number(v) || 0));
 
-function applyMediaTimestamp(spatial, seconds, loop) {
-    if (!spatial || !spatial.audio) return;
-    var audio = spatial.audio;
-    var t = Math.max(0, Number(seconds) || 0);
-    try {
-        if (loop && isFinite(audio.duration) && audio.duration > 0) t = t % audio.duration;
-        if (audio.seekable && audio.seekable.length > 0) {
-            var start = audio.seekable.start(0);
-            var end = audio.seekable.end(audio.seekable.length - 1);
-            if (isFinite(end) && end > start) t = Math.max(start, Math.min(t, Math.max(start, end - 0.05)));
-        }
-        audio.currentTime = t;
-        spatial.pendingSeek = null;
-    } catch (e) {
-        spatial.pendingSeek = t;
-    }
-}
-
-function createSpatialMedia(src, volume, loop, pos, onEnd, onError) {
-    var ctx = getDirectAudioContext();
-    if (!ctx) throw new Error('AudioContext unavailable');
-
-    var audio = document.createElement('audio');
-    audio.crossOrigin = 'anonymous';
-    audio.preload = 'auto';
-    audio.autoplay = false;
-    audio.loop = !!loop;
-    audio.src = sanitize(src);
-
-    var source = ctx.createMediaElementSource(audio);
-    var panner = ctx.createPanner();
-    panner.panningModel = 'HRTF';
-    panner.distanceModel = 'inverse';
-    panner.refDistance = 1;
-    panner.rolloffFactor = 0; // distance attenuation is calculated in Lua
-    panner.maxDistance = 10000;
-    panner.coneInnerAngle = 360;
-    panner.coneOuterAngle = 360;
-    panner.coneOuterGain = 1;
-
-    var filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 22050;
-    filter.Q.value = 0.4;
-
-    var gain = ctx.createGain();
-    gain.gain.value = clamp(volume, 0, 1);
-
-    source.connect(panner);
-    panner.connect(filter);
-    filter.connect(gain);
-    if (typeof Howler !== 'undefined' && Howler.ctx === ctx && Howler.masterGain) gain.connect(Howler.masterGain);
-    else gain.connect(ctx.destination);
-    setPannerPosition(panner, pos, ctx);
-
-    var spatial = {
-        audio: audio,
-        source: source,
-        panner: panner,
-        filter: filter,
-        gain: gain,
-        ctx: ctx,
-        pendingSeek: null,
-        failed: false,
-        destroy: function () {
-            try { audio.pause(); } catch (e) {}
-            try { audio.removeAttribute('src'); audio.load(); } catch (e) {}
-            [source, panner, filter, gain].forEach(function (node) {
-                try { node.disconnect(); } catch (e) {}
-            });
-        }
-    };
-
-    audio.addEventListener('loadedmetadata', function () {
-        if (spatial.pendingSeek !== null) applyMediaTimestamp(spatial, spatial.pendingSeek, audio.loop);
-    });
-    audio.addEventListener('canplay', function () {
-        if (spatial.pendingSeek !== null) applyMediaTimestamp(spatial, spatial.pendingSeek, audio.loop);
-    });
-    audio.addEventListener('ended', function () {
-        if (!audio.loop && onEnd) onEnd();
-    });
-    audio.addEventListener('error', function () {
-        if (spatial.failed) return;
-        spatial.failed = true;
-        if (onError) onError(audio.error);
-    });
-
-    return spatial;
-}
-
-function createHowl(src, volume, loop, is3D, pos, onEnd, forceHtml5) {
-    var remote = /^https?:\/\//i.test(src);
-    var useHtml5 = forceHtml5 === true || (remote && !is3D);
-    var h = new Howl({
-        src: [src],
-        volume: clamp(volume, 0, 1),
-        loop: !!loop,
-        html5: useHtml5,
-        onend: function () { if (!loop && onEnd) onEnd(); },
-        onloaderror: function (id, err) { console.error('[pr_3dsound] load error:', src, err); },
-        onplayerror: function (id, err) {
-            console.error('[pr_3dsound] play error:', src, err);
-            tryUnlockCtx();
-        }
-    });
-
-    if (is3D) {
-        h.pannerAttr({
-            panningModel: 'HRTF',
-            distanceModel: 'inverse',
-            refDistance: 1,
-            rolloffFactor: 0,
-            maxDistance: 10000,
-        });
-        if (pos) h.pos(pos.x, pos.y, pos.z);
-    }
-    return h;
-}
-
-function setPlayerVolume(p, value) {
-    var v = clamp(value, 0, 1);
-    if (!p) return;
-    if (p.type === 'youtube') {
+    if (p.type === 'spatialstream' && p.gainNode && Howler.ctx) {
+        p.gainNode.gain.cancelScheduledValues(Howler.ctx.currentTime);
+        p.gainNode.gain.setValueAtTime(v, Howler.ctx.currentTime);
+    } else if (p.type === 'mediastream' && p.audio) {
+        p.audio.volume = v;
+    } else if (p.type === 'youtube') {
         if (p.ytPlayer && p.ytPlayer.setVolume) p.ytPlayer.setVolume(Math.round(v * 100));
     } else if (p.type === 'soundcloud') {
         if (p.scWidget) p.scWidget.setVolume(Math.round(v * 100));
-    } else if (p.spatial && p.spatial.gain) {
-        setAudioParam(p.spatial.gain.gain, v, p.spatial.ctx);
     } else if (p.howl) {
         p.howl.volume(v);
     }
 }
 
-function notifyEnded(index) {
-    if (!players[index]) return;
-    players[index].playing = false;
-    $.post('https://pr_3dsound/soundEnded', JSON.stringify({ index: index }));
-    cleanupPlayer(index);
+function setPlayerVolume(p, v) {
+    v = Math.max(0, Math.min(1, Number(v) || 0));
+    p._baseOutputVolume = v;
+    var fade = (p._fadeMult !== undefined) ? p._fadeMult : 1.0;
+    writePlayerVolume(p, v * fade);
 }
 
-function cleanupPlayer(index) {
-    var p = players[index];
+function animateFadeMultiplier(p, from, to, duration) {
     if (!p) return;
-    if (p.spatial) {
-        try { p.spatial.destroy(); } catch (e) {}
+    if (p._fadeTimer) { clearInterval(p._fadeTimer); p._fadeTimer = null; }
+
+    duration = Math.max(0, Number(duration) || 0);
+    from = Math.max(0, Math.min(1, Number(from) || 0));
+    to = Math.max(0, Math.min(1, Number(to) || 0));
+
+    p._fadeMult = from;
+    writePlayerVolume(p, (p._baseOutputVolume !== undefined ? p._baseOutputVolume : (p.vol || 1)) * p._fadeMult);
+
+    if (duration <= 0) {
+        p._fadeMult = to;
+        writePlayerVolume(p, (p._baseOutputVolume !== undefined ? p._baseOutputVolume : (p.vol || 1)) * p._fadeMult);
+        return;
     }
-    if (p.howl) {
-        try { p.howl.stop(); p.howl.unload(); } catch (e) {}
-    }
-    if (p.type === 'youtube') {
-        if (p.ytPlayer) { try { p.ytPlayer.stopVideo(); p.ytPlayer.destroy(); } catch (e) {} }
-        var yd = document.getElementById('yt-' + index);
-        if (yd) yd.remove();
-    }
-    if (p.type === 'soundcloud') {
-        if (p.scWidget) { try { p.scWidget.pause(); } catch (e) {} }
-        var sd = document.getElementById('sc-' + index);
-        if (sd) sd.remove();
-    }
-    delete players[index];
+
+    var started = performance.now();
+    p._fadeTimer = setInterval(function () {
+        var t = Math.min(1, (performance.now() - started) / duration);
+        p._fadeMult = from + ((to - from) * t);
+        writePlayerVolume(p, (p._baseOutputVolume !== undefined ? p._baseOutputVolume : (p.vol || 1)) * p._fadeMult);
+        if (t >= 1) {
+            clearInterval(p._fadeTimer);
+            p._fadeTimer = null;
+        }
+    }, 40);
 }
 
-function createSCWidget(index, url, volume, loop, options, onReady) {
+// ─── SoundCloud Widget API ────────────────────────────────────────────────────
+
+function createSCWidget(index, url, volume, loop, onReady) {
     var containerId = 'sc-' + index;
     var iframe = document.getElementById(containerId);
     if (!iframe) {
         iframe = document.createElement('iframe');
-        iframe.id = containerId;
-        iframe.width = '1';
+        iframe.id     = containerId;
+        iframe.width  = '1';
         iframe.height = '1';
         iframe.style.cssText = 'position:absolute;left:-9999px;top:-9999px;border:0;';
-        iframe.allow = 'autoplay';
-        iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(sanitize(url))
-            + '&auto_play=true&hide_related=true&show_comments=false&show_user=false'
-            + '&show_reposts=false&show_teaser=false&visual=false&buying=false'
-            + '&liking=false&download=false&sharing=false';
+        iframe.allow  = 'autoplay';
+        var embedSrc = 'https://w.soundcloud.com/player/?url='
+            + encodeURIComponent(DOMPurify.sanitize(url))
+            + '&auto_play=true&hide_related=true&show_comments=false'
+            + '&show_user=false&show_reposts=false&show_teaser=false'
+            + '&visual=false&buying=false&liking=false&download=false&sharing=false';
+        iframe.src = embedSrc;
         document.body.appendChild(iframe);
     }
 
-    function bind(attempts) {
+    function tryBind(attempts) {
         if (typeof SC === 'undefined' || !SC.Widget) {
-            if (attempts > 0) setTimeout(function () { bind(attempts - 1); }, 200);
-            else console.error('[pr_3dsound] SoundCloud Widget API unavailable.');
+            if (attempts > 0) setTimeout(function () { tryBind(attempts - 1); }, 200);
+            else console.error('[pr_3dsound] SoundCloud Widget API não carregou.');
             return;
         }
         var widget = SC.Widget(iframe);
-        if (players[index]) players[index].scWidget = widget;
         widget.bind(SC.Widget.Events.READY, function () {
             widget.setVolume(Math.round(volume * 100));
-            if (options.startTime > 0) widget.seekTo(options.startTime * 1000);
             if (loop) {
-                widget.bind(SC.Widget.Events.FINISH, function () { widget.seekTo(0); widget.play(); });
+                widget.bind(SC.Widget.Events.FINISH, function () {
+                    widget.seekTo(0);
+                    widget.play();
+                });
             } else {
-                widget.bind(SC.Widget.Events.FINISH, function () { notifyEnded(index); });
+                widget.bind(SC.Widget.Events.FINISH, function () {
+                    notifyEnded(index);
+                });
             }
-            if (players[index] && players[index].paused) widget.pause();
             if (onReady) onReady(widget);
         });
         widget.bind(SC.Widget.Events.ERROR, function (e) {
             console.warn('[pr_3dsound] SoundCloud error index=' + index, e);
         });
+        if (players[index]) players[index].scWidget = widget;
     }
-    bind(25);
+    tryBind(25);
 }
+
+// ─── YouTube IFrame API ───────────────────────────────────────────────────────
 
 window.onYouTubeIframeAPIReady = function () {
     ytReady = true;
@@ -345,7 +187,7 @@ window.onYouTubeIframeAPIReady = function () {
     ytQueue = [];
 };
 
-function createYTPlayer(index, videoId, volume, loop, options, onReady) {
+function createYTPlayer(index, videoId, volume, loop, onReady) {
     var containerId = 'yt-' + index;
     var div = document.getElementById(containerId);
     if (!div) {
@@ -355,35 +197,55 @@ function createYTPlayer(index, videoId, volume, loop, options, onReady) {
         document.getElementById('trash').appendChild(div);
     }
 
-    var unmuteOnPlay = true;
+    //
+    // SOLUÇÃO PARA O BUG DE PLAY→PAUSE→PLAY DO CEF/CHROME:
+    //
+    // O Chromium Embedded Framework bloqueia autoplay de mídia COM SOM.
+    // Quando o YT Player tenta tocar com volume > 0, o CEF pausa imediatamente
+    // após iniciar — causando o ciclo play→pause→play visível.
+    //
+    // A solução definitiva: iniciar MUTADO (mute:1) para bypassar a política,
+    // aguardar o primeiro evento PLAYING confirmar que o vídeo está rodando,
+    // então desmutar e setar o volume correto.
+    // Após o primeiro PLAYING, o CEF já não bloqueia mais a reprodução.
+    //
+    var _unmuteOnPlay = true;   // flag: ainda precisa desmutar na primeira vez?
+
     return new YT.Player(containerId, {
         height: '0', width: '0', videoId: videoId,
         playerVars: {
-            autoplay: 1, controls: 0, disablekb: 1, iv_load_policy: 3,
-            modestbranding: 1, playsinline: 1, mute: 1,
-            start: Math.floor(options.startTime || 0),
+            autoplay:       1,
+            controls:       0,
+            disablekb:      1,
+            iv_load_policy: 3,
+            modestbranding: 1,
+            playsinline:    1,
+            mute:           1,   // ← começa mutado para bypassar política de autoplay
         },
         events: {
             onReady: function (e) {
+                // Já está mutado por playerVars; garante e dá play
                 e.target.mute();
                 e.target.setVolume(0);
-                if (options.startTime > 0) e.target.seekTo(options.startTime, true);
-                e.target.playVideo();
+                if (loop) {
+                    e.target.setLoop(true);
+                    e.target.loadVideoById({ videoId: videoId, suggestedQuality: 'small' });
+                } else {
+                    e.target.playVideo();
+                }
                 if (onReady) onReady(e.target);
             },
             onStateChange: function (e) {
                 if (e.data === YT.PlayerState.PLAYING) {
-                    if (unmuteOnPlay) {
-                        unmuteOnPlay = false;
+                    if (_unmuteOnPlay) {
+                        // Primeiro PLAYING confirmado → agora é seguro desmutar
+                        _unmuteOnPlay = false;
                         e.target.unMute();
                         e.target.setVolume(Math.round(volume * 100));
                     }
-                    var p = players[index];
-                    if (p) {
-                        p.playing = true;
-                        if (p.paused) e.target.pauseVideo();
-                    }
-                } else if (e.data === YT.PlayerState.ENDED) {
+                    if (players[index]) players[index].playing = true;
+                }
+                if (e.data === YT.PlayerState.ENDED) {
                     if (players[index] && players[index].loop) {
                         e.target.seekTo(0); e.target.playVideo();
                     } else {
@@ -391,179 +253,775 @@ function createYTPlayer(index, videoId, volume, loop, options, onReady) {
                     }
                 }
             },
-            onError: function (e) {
-                console.warn('[pr_3dsound] YouTube error', e.data, 'index', index);
-            }
+            onError: function (e) { console.warn('[pr_3dsound] YouTube error', e.data, 'index', index); }
         }
     });
 }
 
-function setupExternalPlayer(index, url, volume, pos, loop, options, positional) {
-    var urlType = detectUrlType(url);
-    options = options || {};
-    options.startTime = Math.max(0, Number(options.startTime) || 0);
+// ─── Notificação e cleanup ────────────────────────────────────────────────────
 
-    if (urlType === 'youtube') {
-        var vid = extractYouTubeId(url);
-        if (!vid) { console.warn('[pr_3dsound] invalid YouTube ID:', url); return; }
-        var ytP = newPlayer({
-            type: 'youtube', vol: volume, maxVol: volume, pos: positional ? pos : null,
-            loop: !!loop, is2D: !positional, _lastDistVol: volume,
-            paused: options.paused === true,
-        });
-        players[index] = ytP;
-        var create = function () {
-            if (!players[index]) return;
-            players[index].ytPlayer = createYTPlayer(index, vid, volume, loop, options, function () {
-                if (players[index]) players[index].playing = !players[index].paused;
-            });
-        };
-        ytReady ? create() : ytQueue.push(create);
-        return;
+function notifyEnded(index) {
+    if (!players[index]) return;
+    players[index].playing = false;
+    $.post('http://pr_3dsound/soundEnded', JSON.stringify({ index: index }));
+    cleanupPlayer(index);
+}
+
+function notifyError(index, reason) {
+    $.post('http://pr_3dsound/soundError', JSON.stringify({
+        index: index,
+        reason: String(reason || 'Falha ao reproduzir o stream.')
+    }));
+    cleanupPlayer(index);
+}
+
+function cleanupPlayer(index) {
+    var p = players[index];
+    if (!p) return;
+
+    if (p._fadeTimer) { clearInterval(p._fadeTimer); p._fadeTimer = null; }
+
+    if (p.type === 'local' || p.type === 'stream') {
+        if (p.howl) { p.howl.stop(); p.howl.unload(); }
+    } else if (p.type === 'spatialstream') {
+        destroySpatialStream(p);
+    } else if (p.type === 'mediastream') {
+        destroyMediaStream(p);
+    } else if (p.type === 'youtube') {
+        if (p.ytPlayer) { try { p.ytPlayer.stopVideo(); p.ytPlayer.destroy(); } catch (e) {} }
+        var yd = document.getElementById('yt-' + index);
+        if (yd) yd.remove();
+    } else if (p.type === 'soundcloud') {
+        if (p.scWidget) { try { p.scWidget.pause(); } catch (e) {} }
+        var sd = document.getElementById('sc-' + index);
+        if (sd) sd.remove();
     }
 
-    if (urlType === 'soundcloud') {
-        var scP = newPlayer({
-            type: 'soundcloud', vol: volume, maxVol: volume, pos: positional ? pos : null,
-            loop: !!loop, is2D: !positional, _lastDistVol: volume,
-            paused: options.paused === true,
-        });
-        players[index] = scP;
-        createSCWidget(index, url, volume, loop, options, function () {
-            if (players[index]) players[index].playing = !players[index].paused;
-        });
-        return;
-    }
+    delete players[index];
+}
 
-    if (!positional) {
-        var h2d = createHowl(sanitize(url), volume, loop, false, null, function () { notifyEnded(index); }, true);
-        var p2d = newPlayer({
-            type: 'stream', howl: h2d, vol: volume, maxVol: volume,
-            loop: !!loop, is2D: true, _lastDistVol: volume,
-            paused: options.paused === true,
-        });
-        players[index] = p2d;
-        h2d.once('play', function () {
-            if (options.startTime > 0) {
-                try { h2d.seek(options.startTime); } catch (e) {}
+// ─── Howler / WebAudio helpers ────────────────────────────────────────────────
+
+function createHowl(src, volume, loop, is3D, pos, onEnd) {
+    var isStream = /^https?:\/\//i.test(src);
+    // HTML5 Audio não fornece o pipeline espacial do Howler. Para arquivos
+    // locais 3D usamos WebAudio mesmo em .ogg. URL 2D pode continuar em html5.
+    var useHtml5 = isStream && !is3D;
+
+    var h = new Howl({
+        src: [src],
+        volume: volume,
+        loop: !!loop,
+        html5: useHtml5,
+        preload: true,
+        onend: function () { if (!loop && onEnd) onEnd(); },
+        onloaderror: function (id, err) { console.error('[pr_3dsound] Falha ao carregar:', src, err); },
+        onplayerror: function (id, err) {
+            console.error('[pr_3dsound] Falha ao tocar:', src, err);
+            if (Howler.ctx && Howler.ctx.resume) {
+                Howler.ctx.resume().then(function () { h.play(); }).catch(function () {});
             }
-            if (p2d.paused) h2d.pause();
-        });
-        h2d.play();
-        p2d.playing = !p2d.paused;
-        return;
-    }
-
-    // True 3D direct URL via WebAudio MediaElementSource.
-    var p3d = newPlayer({
-        type: 'spatial-stream', vol: volume, maxVol: volume, pos: pos,
-        loop: !!loop, is2D: false, _lastDistVol: volume,
-        paused: options.paused === true,
+        },
+        onload: function () {
+            if (Howler.ctx && Howler.ctx.state === 'suspended') Howler.ctx.resume().catch(function () {});
+        },
     });
-    players[index] = p3d;
 
-    function fallbackToHtml5(error) {
-        if (!players[index] || players[index] !== p3d) return;
-        console.warn('[pr_3dsound] Direct URL could not use WebAudio/CORS; falling back to non-HRTF HTML5 audio:', url, error || '');
-        if (p3d.spatial) { try { p3d.spatial.destroy(); } catch (e) {} }
-        p3d.spatial = null;
-        p3d.type = 'stream-fallback';
-        var h = createHowl(sanitize(url), volume, loop, false, null, function () { notifyEnded(index); }, true);
-        p3d.howl = h;
-        h.once('play', function () {
-            if (options.startTime > 0) {
-                try { h.seek(options.startTime); } catch (e) {}
-            }
-            if (p3d.paused) h.pause();
+    if (is3D) {
+        // Distância é calculada no Lua. O panner fica responsável apenas pela
+        // direção/HRTF, evitando atenuação duplicada.
+        h.pannerAttr({
+            panningModel: 'HRTF',
+            distanceModel: 'linear',
+            refDistance: 1,
+            maxDistance: 100000,
+            rolloffFactor: 0,
         });
-        h.play();
-        p3d.playing = !p3d.paused;
+        if (pos) h.pos(pos.x, pos.y, pos.z);
     }
 
-    try {
-        p3d.spatial = createSpatialMedia(url, volume, loop, pos, function () { notifyEnded(index); }, fallbackToHtml5);
-        if (options.startTime > 0) {
-            p3d.spatial.pendingSeek = options.startTime;
-            applyMediaTimestamp(p3d.spatial, options.startTime, loop);
+    return h;
+}
+
+function seekHowlWhenReady(howl, seconds, loop) {
+    seconds = Number(seconds) || 0;
+    if (!howl || seconds <= 0) return;
+
+    var apply = function () {
+        try {
+            var duration = howl.duration();
+            var target = seconds;
+            if (loop && isFinite(duration) && duration > 0) target = seconds % duration;
+            else if (isFinite(duration) && duration > 0) target = Math.min(seconds, Math.max(0, duration - 0.05));
+            howl.seek(target);
+        } catch (e) {
+            console.warn('[pr_3dsound] Não foi possível aplicar timestamp Howl:', e);
         }
-        tryUnlockCtx();
-        var playPromise = p3d.spatial.audio.play();
-        if (playPromise && playPromise.catch) {
-            playPromise.catch(function (e) {
-                // Autoplay failures can often be fixed by resuming the AudioContext; do not
-                // immediately abandon spatial audio unless the media element itself errors.
+    };
+
+    if (howl.state && howl.state() === 'loaded') apply();
+    else howl.once('load', apply);
+}
+
+function setPannerPosition(node, pos) {
+    if (!node || !pos) return;
+    var ctx = Howler.ctx;
+    var x = Number(pos.x) || 0;
+    var y = Number(pos.y) || 0;
+    var z = Number(pos.z) || 0;
+
+    if (node.positionX && ctx) {
+        node.positionX.setValueAtTime(x, ctx.currentTime);
+        node.positionY.setValueAtTime(y, ctx.currentTime);
+        node.positionZ.setValueAtTime(z, ctx.currentTime);
+    } else if (node.setPosition) {
+        node.setPosition(x, y, z);
+    }
+}
+
+function seekMediaWhenReady(audio, seconds, loop) {
+    seconds = Math.max(0, Number(seconds) || 0);
+    if (!audio) return;
+
+    var apply = function () {
+        try {
+            var target = seconds;
+            var duration = Number(audio.duration);
+
+            if (isFinite(duration) && duration > 0) {
+                target = loop ? (seconds % duration) : Math.min(seconds, Math.max(0, duration - 0.05));
+            } else if (audio.seekable && audio.seekable.length) {
+                // HLS/MSE pode reportar duration=Infinity por alguns instantes.
+                // Nesse caso use a janela seekable em vez de desistir do seek.
+                var start = audio.seekable.start(0);
+                var end = audio.seekable.end(audio.seekable.length - 1);
+                target = Math.max(start, Math.min(seconds, Math.max(start, end - 0.05)));
+            }
+
+            audio.currentTime = target;
+        } catch (e) {
+            console.warn('[pr_3dsound] Stream não aceita seek de sincronização:', e);
+        }
+    };
+
+    if (audio.readyState >= 1) apply();
+    else {
+        audio.addEventListener('loadedmetadata', apply, { once: true });
+        audio.addEventListener('durationchange', apply, { once: true });
+    }
+}
+
+
+function seekMediaAndThen(audio, seconds, loop, done) {
+    seconds = Math.max(0, Number(seconds) || 0);
+    if (!audio) { if (done) done(); return; }
+
+    var finished = false;
+    var timer = null;
+    var finish = function () {
+        if (finished) return;
+        finished = true;
+        if (timer) clearTimeout(timer);
+        if (done) done();
+    };
+
+    var apply = function () {
+        if (finished) return true;
+        try {
+            var hasMetadata = audio.readyState >= 1 || (audio.seekable && audio.seekable.length);
+            if (!hasMetadata) return false;
+
+            var target = seconds;
+            var duration = Number(audio.duration);
+            if (isFinite(duration) && duration > 0) {
+                target = loop ? (seconds % duration) : Math.min(seconds, Math.max(0, duration - 0.05));
+            } else if (audio.seekable && audio.seekable.length) {
+                var start = audio.seekable.start(0);
+                var end = audio.seekable.end(audio.seekable.length - 1);
+                target = Math.max(start, Math.min(seconds, Math.max(start, end - 0.05)));
+            }
+
+            var onSeeked = function () { finish(); };
+            audio.addEventListener('seeked', onSeeked, { once: true });
+            audio.currentTime = target;
+
+            // Alguns CEF não disparam seeked quando a diferença é muito pequena.
+            if (Math.abs((Number(audio.currentTime) || 0) - target) < 0.08) {
+                setTimeout(finish, 0);
+            } else {
+                timer = setTimeout(finish, 900);
+            }
+            return true;
+        } catch (e) {
+            console.warn('[pr_3dsound] Stream não aceitou seek atômico:', e);
+            finish();
+            return true;
+        }
+    };
+
+    if (apply()) return;
+    var retry = function () { apply(); };
+    audio.addEventListener('loadedmetadata', retry, { once: true });
+    audio.addEventListener('durationchange', retry, { once: true });
+    audio.addEventListener('canplay', retry, { once: true });
+    timer = setTimeout(function () {
+        if (!apply()) finish();
+    }, 1400);
+}
+
+function setupHlsOnAudio(audio, src, onReady, onError) {
+    var hls = null;
+    var readyCalled = false;
+
+    function ready() {
+        if (readyCalled) return;
+        readyCalled = true;
+        if (onReady) onReady();
+    }
+
+    if (!isHlsUrl(src)) {
+        audio.src = src;
+        audio.addEventListener('loadedmetadata', ready, { once: true });
+        return null;
+    }
+
+    // Safari/native HLS (caso o CEF passe a suportar nativamente).
+    if (audio.canPlayType && audio.canPlayType('application/vnd.apple.mpegurl')) {
+        audio.src = src;
+        audio.addEventListener('loadedmetadata', ready, { once: true });
+        return null;
+    }
+
+    if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+        throw new Error('HLS.js/MSE indisponivel no CEF');
+    }
+
+    hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 30,
+    });
+
+    hls.attachMedia(audio);
+    hls.on(Hls.Events.MEDIA_ATTACHED, function () {
+        hls.loadSource(src);
+    });
+    hls.on(Hls.Events.MANIFEST_PARSED, ready);
+    var networkRetryCount = 0;
+    var maxNetworkRetries = 3;
+
+    hls.on(Hls.Events.ERROR, function (event, data) {
+        if (!data || !data.fatal) return;
+        var status = data.response && (data.response.code || data.response.status);
+        if (!status && data.networkDetails) status = data.networkDetails.status;
+        var failedUrl = (data.response && data.response.url) || (data.context && data.context.url) || src;
+        console.error('[pr_3dsound] HLS fatal:', data.type, data.details,
+            'status=', status || 0, 'url=', failedUrl, 'headers=', hasHttpHeadersForUrl(failedUrl),
+            'retry=', networkRetryCount + '/' + maxNetworkRetries);
+
+        // Evita loop infinito de manifestLoadError. Se CORS/rede estiver quebrado,
+        // repetir para sempre apenas polui o console e mantém um player inválido vivo.
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            if (networkRetryCount >= maxNetworkRetries) {
+                console.error('[pr_3dsound] HLS abortado apos', maxNetworkRetries, 'retries:', src);
+                try { hls.stopLoad(); } catch (e) {}
+                if (onError) onError(data);
+                return;
+            }
+            networkRetryCount++;
+            setTimeout(function () {
+                try {
+                    hls.stopLoad();
+                    hls.loadSource(src);
+                    hls.startLoad();
+                } catch (e) {}
+            }, 750 * networkRetryCount);
+            return;
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            try { hls.recoverMediaError(); } catch (e) {}
+            return;
+        }
+
+        if (onError) onError(data);
+    });
+
+    return hls;
+}
+
+function startMediaElement(audio, options, loop) {
+    options = options || {};
+
+    var playNow = function () {
+        if (options.paused) return;
+        var promise = audio.play();
+        if (promise && promise.catch) {
+            promise.catch(function (err) {
+                console.warn('[pr_3dsound] Autoplay bloqueado; tentando novamente.', err);
                 tryUnlockCtx();
                 setTimeout(function () {
-                    if (!players[index] || !p3d.spatial || p3d.paused) return;
-                    p3d.spatial.audio.play().catch(function () {});
-                }, 150);
+                    var retry = audio.play();
+                    if (retry && retry.catch) retry.catch(function () {});
+                }, 50);
             });
         }
-        if (p3d.paused) p3d.spatial.audio.pause();
-        p3d.playing = !p3d.paused;
-    } catch (e) {
-        fallbackToHtml5(e);
+    };
+
+    // Em stream-in/recriação HLS, nunca comece do zero para só depois fazer seek.
+    // O play acontece somente quando o timestamp autoritativo já foi aplicado.
+    if (Number(options.startAt) > 0.05) {
+        seekMediaAndThen(audio, options.startAt, loop, playNow);
+    } else {
+        playNow();
     }
 }
 
+function createMediaStream(src, volume, loop, options, onEnd, onError) {
+    options = options || {};
+    var audio = document.createElement('audio');
+    audio.crossOrigin = 'anonymous';
+    audio.preload = 'auto';
+    audio.loop = !!loop;
+    audio.autoplay = false;
+    audio.volume = Math.max(0, Math.min(1, Number(volume) || 0));
+    audio.style.display = 'none';
+    document.body.appendChild(audio);
+
+    if (!loop && onEnd) audio.addEventListener('ended', onEnd, { once: true });
+    audio.addEventListener('error', function () {
+        console.error('[pr_3dsound] Falha no media stream:', src, 'mediaError=', audio.error && audio.error.code);
+        if (onError) onError(audio.error);
+    });
+
+    var hls = setupHlsOnAudio(audio, src, function () {
+        startMediaElement(audio, options, loop);
+    }, onError);
+
+    // Para URL nao-HLS, loadedmetadata dispara startMediaElement via setup.
+    return { audio: audio, hls: hls };
+}
+
+function destroyMediaStream(p) {
+    if (!p) return;
+    try { if (p.hls) p.hls.destroy(); } catch (e) {}
+    try {
+        if (p.audio) {
+            p.audio.pause();
+            p.audio.removeAttribute('src');
+            p.audio.load();
+            p.audio.remove();
+        }
+    } catch (e) {}
+}
+
+function createSpatialStream(src, volume, loop, pos, options, onEnd, onError) {
+    options = options || {};
+    tryUnlockCtx();
+
+    var ctx = Howler.ctx;
+    if (!ctx || !ctx.createMediaElementSource || !ctx.createPanner) {
+        throw new Error('WebAudio MediaElementSource/PannerNode indisponivel no CEF');
+    }
+
+    var audio = document.createElement('audio');
+    audio.crossOrigin = 'anonymous';
+    audio.preload = 'auto';
+    audio.loop = !!loop;
+    audio.autoplay = false;
+    audio.volume = 1.0; // volume espacial e controlado no GainNode
+    audio.style.display = 'none';
+    document.body.appendChild(audio);
+
+    var sourceNode = ctx.createMediaElementSource(audio);
+    var pannerNode = ctx.createPanner();
+    var filterNode = ctx.createBiquadFilter();
+    var gainNode = ctx.createGain();
+
+    pannerNode.panningModel = 'HRTF';
+    pannerNode.distanceModel = 'linear';
+    pannerNode.refDistance = 1;
+    pannerNode.maxDistance = 100000;
+    pannerNode.rolloffFactor = 0;
+    setPannerPosition(pannerNode, pos);
+
+    filterNode.type = 'lowpass';
+    filterNode.frequency.setValueAtTime(22050, ctx.currentTime);
+    filterNode.Q.setValueAtTime(0.2, ctx.currentTime);
+    gainNode.gain.setValueAtTime(Math.max(0, Math.min(1, Number(volume) || 0)), ctx.currentTime);
+
+    sourceNode.connect(pannerNode);
+    pannerNode.connect(filterNode);
+    filterNode.connect(gainNode);
+    gainNode.connect(ctx.destination);
+
+    if (!loop && onEnd) audio.addEventListener('ended', onEnd, { once: true });
+    audio.addEventListener('error', function () {
+        console.error('[pr_3dsound] Falha no stream 3D:', src, 'mediaError=', audio.error && audio.error.code);
+        if (onError) onError(audio.error);
+    });
+
+    var hls = setupHlsOnAudio(audio, src, function () {
+        startMediaElement(audio, options, loop);
+    }, onError);
+
+    return {
+        audio: audio,
+        hls: hls,
+        sourceNode: sourceNode,
+        pannerNode: pannerNode,
+        filterNode: filterNode,
+        gainNode: gainNode,
+    };
+}
+
+function destroySpatialStream(p) {
+    if (!p) return;
+
+    try { if (p.hls) p.hls.destroy(); } catch (e) {}
+    try {
+        if (p.audio) {
+            p.audio.pause();
+            p.audio.removeAttribute('src');
+            p.audio.load();
+            p.audio.remove();
+        }
+    } catch (e) {}
+
+    [p.sourceNode, p.pannerNode, p.filterNode, p.gainNode].forEach(function (node) {
+        try { if (node) node.disconnect(); } catch (e) {}
+    });
+}
+
+function newPlayer(extra) {
+    return Object.assign({
+        vol: 1,
+        maxVol: 1,
+        playing: false,
+        paused: false,
+        loop: false,
+        audio: null,
+        hls: null,
+        sourceNode: null,
+        pannerNode: null,
+        gainNode: null,
+        filterNode: null,
+        _occlusionMult: 1.0,
+        _lastDistVol: 1.0,
+        _fadeMult: 1.0,
+        _fadeTimer: null,
+        _baseOutputVolume: 1.0,
+    }, extra);
+}
+
+// ─── API pública ──────────────────────────────────────────────────────────────
+
 var SoundPlayer = {
+
     play: function (index, file, volume, pos, loop, is2D, options) {
         cleanupPlayer(index);
         options = options || {};
-        var src = './sounds/' + sanitize(file);
+
+        var src = './sounds/' + DOMPurify.sanitize(file);
         var is3D = !is2D && !!pos;
-        var howl = createHowl(src, volume, loop, is3D, pos, function () { notifyEnded(index); }, false);
-        var p = newPlayer({
-            type: 'local', howl: howl, vol: volume, maxVol: volume,
-            pos: is3D ? pos : null, is2D: !!is2D, playing: true,
-            loop: !!loop, _lastDistVol: volume, paused: options.paused === true,
+        var howl = createHowl(src, volume, loop, is3D, is3D ? pos : null, function () { notifyEnded(index); });
+
+        seekHowlWhenReady(howl, options.startAt, loop);
+        if (!options.paused) howl.play();
+
+        players[index] = newPlayer({
+            type: 'local',
+            howl: howl,
+            vol: volume,
+            maxVol: volume,
+            pos: is3D ? pos : null,
+            is2D: !!is2D,
+            playing: !options.paused,
+            paused: !!options.paused,
+            loop: !!loop,
+            _lastDistVol: volume,
+            _baseOutputVolume: volume,
         });
-        players[index] = p;
-        howl.once('play', function () {
-            if (options.startTime > 0) {
-                try { howl.seek(options.startTime); } catch (e) {}
-            }
-            if (p.paused) howl.pause();
-        });
-        howl.play();
     },
 
     playUrl: function (index, url, volume, loop, options) {
         cleanupPlayer(index);
-        setupExternalPlayer(index, url, volume, null, loop, options || {}, false);
+        options = options || {};
+        var urlType = detectUrlType(url);
+
+        if (urlType === 'youtube') {
+            var vid = extractYouTubeId(url);
+            if (!vid) { console.warn('[pr_3dsound] YT ID inválido:', url); return; }
+
+            players[index] = newPlayer({
+                type: 'youtube', ytPlayer: null, vol: volume, maxVol: volume,
+                loop: !!loop, paused: !!options.paused, playing: false,
+                _lastDistVol: volume, _baseOutputVolume: volume,
+            });
+
+            var doCreate = function () {
+                if (!players[index]) return;
+                players[index].ytPlayer = createYTPlayer(index, vid, volume, loop, function (player) {
+                    if (!players[index]) return;
+                    if (Number(options.startAt) > 0) { try { player.seekTo(Number(options.startAt), true); } catch (e) {} }
+                    if (options.paused) { try { player.pauseVideo(); } catch (e) {} }
+                    players[index].playing = !options.paused;
+                    if (options.onPlayStart) options.onPlayStart({ index: index });
+                });
+            };
+            ytReady ? doCreate() : ytQueue.push(doCreate);
+
+        } else if (urlType === 'soundcloud') {
+            players[index] = newPlayer({
+                type: 'soundcloud', scWidget: null, vol: volume, maxVol: volume,
+                loop: !!loop, paused: !!options.paused, playing: false,
+                _lastDistVol: volume, _baseOutputVolume: volume,
+            });
+
+            createSCWidget(index, url, volume, loop, function (widget) {
+                if (!players[index]) return;
+                if (Number(options.startAt) > 0) { try { widget.seekTo(Number(options.startAt) * 1000); } catch (e) {} }
+                if (options.paused) { try { widget.pause(); } catch (e) {} }
+                players[index].playing = !options.paused;
+                if (options.onPlayStart) options.onPlayStart({ index: index });
+            });
+
+        } else {
+            var cleanUrl2D = DOMPurify.sanitize(url);
+
+            if (isHlsUrl(cleanUrl2D)) {
+                try {
+                    var media = createMediaStream(cleanUrl2D, volume, loop, options, function () {
+                        if (options.onPlayEnd) options.onPlayEnd({ index: index, url: url });
+                        notifyEnded(index);
+                    }, function (hlsErr) {
+                        console.error('[pr_3dsound] HLS 2D falhou:', cleanUrl2D);
+                        notifyError(index, hlsErr && (hlsErr.details || hlsErr.message) || 'Falha HLS 2D');
+                    });
+
+                    players[index] = newPlayer({
+                        type: 'mediastream', audio: media.audio, hls: media.hls, url: cleanUrl2D,
+                        vol: volume, maxVol: volume,
+                        playing: !options.paused, paused: !!options.paused, loop: !!loop,
+                        _lastDistVol: volume, _baseOutputVolume: volume,
+                    });
+                    if (options.onPlayStart && !options.paused) options.onPlayStart({ index: index });
+                } catch (err) {
+                    console.error('[pr_3dsound] Nao foi possivel iniciar HLS 2D:', err);
+                    notifyError(index, err && err.message || 'Falha ao iniciar HLS 2D');
+                }
+            } else {
+                var howl = createHowl(cleanUrl2D, volume, loop, false, null, function () {
+                    if (options.onPlayEnd) options.onPlayEnd({ index: index, url: url });
+                    notifyEnded(index);
+                });
+
+                seekHowlWhenReady(howl, options.startAt, loop);
+                if (!options.paused) howl.play();
+
+                players[index] = newPlayer({
+                    type: 'stream', howl: howl, vol: volume, maxVol: volume,
+                    playing: !options.paused, paused: !!options.paused, loop: !!loop,
+                    _lastDistVol: volume, _baseOutputVolume: volume,
+                });
+
+                if (options.onPlayStart && !options.paused) {
+                    howl.once('play', function () { options.onPlayStart({ index: index }); });
+                }
+            }
+        }
     },
 
     playUrlPos: function (index, url, volume, pos, loop, options) {
         cleanupPlayer(index);
-        setupExternalPlayer(index, url, volume, pos, loop, options || {}, true);
+        options = options || {};
+        var urlType = detectUrlType(url);
+        var maxVolume = (options.maxVolume !== undefined) ? Number(options.maxVolume) : Number(volume);
+        if (!isFinite(maxVolume)) maxVolume = Number(volume) || 0;
+        maxVolume = Math.max(0, Math.min(1, maxVolume));
+        var initialDistVolume = (options.initialDistVolume !== undefined) ? Number(options.initialDistVolume) : Number(volume);
+        if (!isFinite(initialDistVolume)) initialDistVolume = Number(volume) || 0;
+        var initialOcclusionMult = (options.initialOcclusionMult !== undefined) ? Number(options.initialOcclusionMult) : 1.0;
+        if (!isFinite(initialOcclusionMult)) initialOcclusionMult = 1.0;
+        initialOcclusionMult = Math.max(0, Math.min(1, initialOcclusionMult));
+
+        // Iframes de YouTube/SoundCloud são cross-origin: o browser não permite
+        // conectar o áudio interno deles ao nosso PannerNode. Eles continuam com
+        // volume/distância/oclusão. URL DIRETA usa WebAudio HRTF de verdade.
+        if (urlType === 'youtube') {
+            var vid = extractYouTubeId(url);
+            if (!vid) { console.warn('[pr_3dsound] YT ID inválido:', url); return; }
+
+            players[index] = newPlayer({
+                type: 'youtube', ytPlayer: null, vol: maxVolume, maxVol: maxVolume, pos: pos,
+                loop: !!loop, paused: !!options.paused, playing: false,
+                _occlusionMult: initialOcclusionMult, _lastDistVol: initialDistVolume, _baseOutputVolume: volume,
+            });
+
+            var doCreate = function () {
+                if (!players[index]) return;
+                players[index].ytPlayer = createYTPlayer(index, vid, volume, loop, function (player) {
+                    if (!players[index]) return;
+                    if (Number(options.startAt) > 0) { try { player.seekTo(Number(options.startAt), true); } catch (e) {} }
+                    if (options.paused) { try { player.pauseVideo(); } catch (e) {} }
+                    players[index].playing = !options.paused;
+                    if (options.onPlayStart) options.onPlayStart({ index: index });
+                });
+            };
+            ytReady ? doCreate() : ytQueue.push(doCreate);
+
+        } else if (urlType === 'soundcloud') {
+            players[index] = newPlayer({
+                type: 'soundcloud', scWidget: null, vol: maxVolume, maxVol: maxVolume, pos: pos,
+                loop: !!loop, paused: !!options.paused, playing: false,
+                _occlusionMult: initialOcclusionMult, _lastDistVol: initialDistVolume, _baseOutputVolume: volume,
+            });
+
+            createSCWidget(index, url, volume, loop, function (widget) {
+                if (!players[index]) return;
+                if (Number(options.startAt) > 0) { try { widget.seekTo(Number(options.startAt) * 1000); } catch (e) {} }
+                if (options.paused) { try { widget.pause(); } catch (e) {} }
+                players[index].playing = !options.paused;
+                if (options.onPlayStart) options.onPlayStart({ index: index });
+            });
+
+        } else {
+            var cleanUrl = DOMPurify.sanitize(url);
+
+            try {
+                var nodes = createSpatialStream(cleanUrl, volume, loop, pos, options, function () {
+                    if (options.onPlayEnd) options.onPlayEnd({ index: index, url: url });
+                    notifyEnded(index);
+                }, function () {
+                    var current = players[index];
+                    if (!current || current.type !== 'spatialstream') return;
+
+                    destroySpatialStream(current);
+
+                    if (isHlsUrl(cleanUrl)) {
+                        try {
+                            var fallbackMedia = createMediaStream(cleanUrl, volume, loop, options, function () {
+                                if (options.onPlayEnd) options.onPlayEnd({ index: index, url: url });
+                                notifyEnded(index);
+                            }, function (hlsErr) {
+                                console.error('[pr_3dsound] HLS 2D fallback falhou:', cleanUrl, hlsErr || 'erro desconhecido');
+                                notifyError(index, hlsErr && (hlsErr.details || hlsErr.message) || 'Falha no fallback HLS');
+                            });
+
+                            players[index] = newPlayer({
+                                type: 'mediastream', audio: fallbackMedia.audio, hls: fallbackMedia.hls,
+                                url: cleanUrl, vol: maxVolume, maxVol: maxVolume, pos: pos,
+                                playing: !options.paused, paused: !!options.paused, loop: !!loop,
+                                _occlusionMult: initialOcclusionMult, _lastDistVol: initialDistVolume, _baseOutputVolume: volume,
+                            });
+                        } catch (fallbackErr) {
+                            console.error('[pr_3dsound] Não foi possível iniciar HLS.js no fallback 2D:', fallbackErr);
+                            notifyError(index, fallbackErr && fallbackErr.message || 'Falha ao iniciar fallback HLS');
+                        }
+                    } else {
+                        var fallback = createHowl(cleanUrl, volume, loop, false, null, function () { notifyEnded(index); });
+                        seekHowlWhenReady(fallback, options.startAt, loop);
+                        if (!options.paused) fallback.play();
+
+                        players[index] = newPlayer({
+                            type: 'stream', howl: fallback, vol: maxVolume, maxVol: maxVolume, pos: pos,
+                            playing: !options.paused, paused: !!options.paused, loop: !!loop,
+                            _occlusionMult: initialOcclusionMult, _lastDistVol: initialDistVolume, _baseOutputVolume: volume,
+                        });
+                    }
+                });
+
+                players[index] = newPlayer({
+                    type: 'spatialstream',
+                    audio: nodes.audio,
+                    hls: nodes.hls,
+                    url: cleanUrl,
+                    sourceNode: nodes.sourceNode,
+                    pannerNode: nodes.pannerNode,
+                    filterNode: nodes.filterNode,
+                    gainNode: nodes.gainNode,
+                    vol: maxVolume,
+                    maxVol: maxVolume,
+                    pos: pos,
+                    playing: !options.paused,
+                    paused: !!options.paused,
+                    loop: !!loop,
+                    _occlusionMult: initialOcclusionMult,
+                    _lastDistVol: initialDistVolume,
+                    _baseOutputVolume: volume,
+                });
+
+                if (options.onPlayStart && !options.paused) options.onPlayStart({ index: index });
+
+            } catch (err) {
+
+                if (isHlsUrl(cleanUrl)) {
+                    try {
+                        var fallbackMedia = createMediaStream(cleanUrl, volume, loop, options, function () {
+                            if (options.onPlayEnd) options.onPlayEnd({ index: index, url: url });
+                            notifyEnded(index);
+                        }, function (hlsErr) {
+                            console.error('[pr_3dsound] HLS 2D fallback falhou:', cleanUrl, hlsErr || 'erro desconhecido');
+                            notifyError(index, hlsErr && (hlsErr.details || hlsErr.message) || 'Falha no fallback HLS');
+                        });
+
+                        players[index] = newPlayer({
+                            type: 'mediastream', audio: fallbackMedia.audio, hls: fallbackMedia.hls,
+                            url: cleanUrl, vol: maxVolume, maxVol: maxVolume, pos: pos,
+                            playing: !options.paused, paused: !!options.paused, loop: !!loop,
+                            _occlusionMult: initialOcclusionMult, _lastDistVol: initialDistVolume, _baseOutputVolume: volume,
+                        });
+                    } catch (fallbackErr) {
+                        console.error('[pr_3dsound] Não foi possível iniciar HLS.js no fallback 2D:', fallbackErr);
+                        notifyError(index, fallbackErr && fallbackErr.message || 'Falha ao iniciar fallback HLS');
+                    }
+                } else {
+                    var fallback = createHowl(cleanUrl, volume, loop, false, null, function () { notifyEnded(index); });
+                    seekHowlWhenReady(fallback, options.startAt, loop);
+                    if (!options.paused) fallback.play();
+
+                    players[index] = newPlayer({
+                        type: 'stream', howl: fallback, vol: maxVolume, maxVol: maxVolume, pos: pos,
+                        playing: !options.paused, paused: !!options.paused, loop: !!loop,
+                        _occlusionMult: initialOcclusionMult, _lastDistVol: initialDistVolume, _baseOutputVolume: volume,
+                    });
+                }
+            }
+        }
     },
 
     updateVolume: function (index, distVolume, playerPos, camDir) {
         var p = players[index];
         if (!p) return;
-        p._lastDistVol = clamp(distVolume, 0, 1);
-        var v = clamp(p._lastDistVol * (p._occlusionMult !== undefined ? p._occlusionMult : 1.0), 0, p.maxVol || 1);
+
+        p._lastDistVol = Number(distVolume) || 0;
+        var max = (p.maxVol !== undefined) ? p.maxVol : 1;
+        var mult = (p._occlusionMult !== undefined) ? p._occlusionMult : 1.0;
+        var v = Math.max(0, Math.min(max, p._lastDistVol * mult));
         setPlayerVolume(p, v);
 
-        // Howler and our custom spatial streams share Howler.ctx, so one listener update
-        // drives both the Howler PannerNodes and MediaElement PannerNodes.
-        if (typeof Howler !== 'undefined') {
-            if (playerPos && Howler.pos) Howler.pos(playerPos.x, playerPos.y, playerPos.z);
-            if (camDir && Howler.orientation) Howler.orientation(camDir.x, camDir.y, camDir.z, 0, 0, 1);
-        }
-        if (p.spatial) setContextListener(p.spatial.ctx, playerPos, camDir);
+        // Howler e os nossos MediaElementSource compartilham o mesmo AudioContext,
+        // então o listener global também posiciona os PannerNodes customizados.
+        if (playerPos) Howler.pos(playerPos.x, playerPos.y, playerPos.z);
+        if (camDir) Howler.orientation(camDir.x, camDir.y, camDir.z, 0, 0, 1);
     },
 
     setFilter: function (index, freq, occlusionMult) {
         var p = players[index];
         if (!p) return;
-        p._occlusionMult = clamp(occlusionMult === undefined ? 1 : occlusionMult, 0, 1);
-        var distVol = p._lastDistVol !== undefined ? p._lastDistVol : p.vol;
-        setPlayerVolume(p, clamp(distVol * p._occlusionMult, 0, p.maxVol || 1));
-        if (p.spatial && p.spatial.filter) {
-            var cutoff = clamp(freq || 22050, 350, 22050);
-            setAudioParam(p.spatial.filter.frequency, cutoff, p.spatial.ctx);
+
+        var mult = (occlusionMult !== undefined) ? Number(occlusionMult) : 1.0;
+        p._occlusionMult = Math.max(0, Math.min(1, mult));
+        p._occlusionFreq = freq;
+
+        if (p.filterNode && Howler.ctx) {
+            var hz = Math.max(250, Math.min(22050, Number(freq) || 22050));
+            p.filterNode.frequency.cancelScheduledValues(Howler.ctx.currentTime);
+            p.filterNode.frequency.setTargetAtTime(hz, Howler.ctx.currentTime, 0.03);
         }
+
+        var distVol = (p._lastDistVol !== undefined) ? p._lastDistVol : (p.vol || 1);
+        var max = (p.maxVol !== undefined) ? p.maxVol : 1;
+        setPlayerVolume(p, Math.max(0, Math.min(max, distVol * p._occlusionMult)));
     },
 
     pause: function (index) {
@@ -571,10 +1029,16 @@ var SoundPlayer = {
         if (!p) return;
         p.paused = true;
         p.playing = false;
-        if (p.type === 'youtube') { if (p.ytPlayer) p.ytPlayer.pauseVideo(); }
-        else if (p.type === 'soundcloud') { if (p.scWidget) p.scWidget.pause(); }
-        else if (p.spatial) { p.spatial.audio.pause(); }
-        else if (p.howl) { p.howl.pause(); }
+
+        if (p.type === 'youtube') {
+            if (p.ytPlayer) p.ytPlayer.pauseVideo();
+        } else if (p.type === 'soundcloud') {
+            if (p.scWidget) p.scWidget.pause();
+        } else if (p.type === 'spatialstream' || p.type === 'mediastream') {
+            if (p.audio) p.audio.pause();
+        } else if (p.howl) {
+            p.howl.pause();
+        }
     },
 
     resume: function (index) {
@@ -582,109 +1046,183 @@ var SoundPlayer = {
         if (!p) return;
         p.paused = false;
         p.playing = true;
-        if (p.type === 'youtube') { if (p.ytPlayer) p.ytPlayer.playVideo(); }
-        else if (p.type === 'soundcloud') { if (p.scWidget) p.scWidget.play(); }
-        else if (p.spatial) { tryUnlockCtx(); p.spatial.audio.play().catch(function () {}); }
-        else if (p.howl) { p.howl.play(); }
+
+        if (p.type === 'youtube') {
+            if (p.ytPlayer) p.ytPlayer.playVideo();
+        } else if (p.type === 'soundcloud') {
+            if (p.scWidget) p.scWidget.play();
+        } else if (p.type === 'spatialstream' || p.type === 'mediastream') {
+            if (p.audio) {
+                var promise = p.audio.play();
+                if (promise && promise.catch) promise.catch(function () {});
+            }
+        } else if (p.howl) {
+            p.howl.play();
+        }
+
         tryUnlockCtx();
     },
 
-    stop: function (index) { cleanupPlayer(index); },
+    pauseAt: function (index, time) {
+        var p = players[index];
+        if (!p) return;
+        time = Math.max(0, Number(time) || 0);
+        p.paused = true;
+        p.playing = false;
+
+        if (p.type === 'youtube') {
+            try { if (p.ytPlayer) { p.ytPlayer.pauseVideo(); p.ytPlayer.seekTo(time, true); } } catch (e) {}
+        } else if (p.type === 'soundcloud') {
+            try { if (p.scWidget) { p.scWidget.pause(); p.scWidget.seekTo(time * 1000); } } catch (e) {}
+        } else if (p.type === 'spatialstream' || p.type === 'mediastream') {
+            if (p.audio) {
+                var keepVolume = p.audio.volume;
+                p.audio.pause();
+                seekMediaAndThen(p.audio, time, p.loop, function () {
+                    if (p.audio) p.audio.volume = keepVolume;
+                });
+            }
+        } else if (p.howl) {
+            try { p.howl.pause(); p.howl.seek(time); } catch (e) {}
+        }
+    },
+
+    resumeAt: function (index, time) {
+        var p = players[index];
+        if (!p) return;
+        time = Math.max(0, Number(time) || 0);
+        p.paused = false;
+        p.playing = true;
+
+        if (p.type === 'youtube') {
+            try { if (p.ytPlayer) { p.ytPlayer.seekTo(time, true); p.ytPlayer.playVideo(); } } catch (e) {}
+        } else if (p.type === 'soundcloud') {
+            try { if (p.scWidget) { p.scWidget.seekTo(time * 1000); p.scWidget.play(); } } catch (e) {}
+        } else if (p.type === 'spatialstream' || p.type === 'mediastream') {
+            if (p.audio) {
+                var keepVolume = p.audio.volume;
+                p.audio.pause();
+                seekMediaAndThen(p.audio, time, p.loop, function () {
+                    if (!p.audio || p.paused) return;
+                    p.audio.volume = keepVolume;
+                    var promise = p.audio.play();
+                    if (promise && promise.catch) promise.catch(function () {});
+                });
+            }
+        } else if (p.howl) {
+            try { p.howl.seek(time); p.howl.play(); } catch (e) {}
+        }
+        tryUnlockCtx();
+    },
+
+
+    stop: function (index) {
+        cleanupPlayer(index);
+    },
 
     updateCoords: function (index, pos) {
         var p = players[index];
         if (!p || !pos) return;
         p.pos = pos;
-        if (p.spatial) setPannerPosition(p.spatial.panner, pos, p.spatial.ctx);
-        if (p.howl && p.type === 'local') p.howl.pos(pos.x, pos.y, pos.z);
+
+        if (p.type === 'spatialstream') {
+            setPannerPosition(p.pannerNode, pos);
+        } else if (p.howl && p.howl.pos) {
+            p.howl.pos(pos.x, pos.y, pos.z);
+        }
     },
 
     setVolume: function (index, volume) {
         var p = players[index];
         if (!p) return;
-        p.vol = p.maxVol = clamp(volume, 0, 1);
-        var v = p.is2D ? p.vol : clamp((p._lastDistVol || p.vol) * (p._occlusionMult || 1), 0, p.maxVol);
-        setPlayerVolume(p, v);
+        var oldMax = (p.maxVol !== undefined) ? Number(p.maxVol) : Number(p.vol || 0);
+        var next = Math.max(0, Math.min(1, Number(volume) || 0));
+        p.vol = p.maxVol = next;
+        p._fadeMult = 1.0;
+
+        // Para emitters 3D preserve a atenuação já calculada. Aplicar `next`
+        // diretamente causava um pico até chegar o próximo updateVolume do Lua.
+        if (p.pos && p._lastDistVol !== undefined) {
+            if (oldMax > 0.0001) p._lastDistVol = Math.max(0, p._lastDistVol * (next / oldMax));
+            else p._lastDistVol = 0;
+            var mult = (p._occlusionMult !== undefined) ? p._occlusionMult : 1.0;
+            setPlayerVolume(p, Math.max(0, Math.min(next, p._lastDistVol * mult)));
+        } else {
+            setPlayerVolume(p, next);
+        }
     },
 
     setVolumeMax: function (index, volume) {
         var p = players[index];
         if (!p) return;
-        p.maxVol = clamp(volume, 0, 1);
+        p.maxVol = Math.max(0, Math.min(1, Number(volume) || 0));
     },
 
     setDistance: function (index, distance) {
         var p = players[index];
         if (!p) return;
-        p.dist = Math.max(1, Number(distance) || 1);
-        if (p.howl && p.type === 'local') p.howl.pannerAttr({ maxDistance: p.dist * 2, rolloffFactor: 0 });
-        if (p.spatial && p.spatial.panner) p.spatial.panner.maxDistance = p.dist * 2;
+        p.dist = Number(distance) || 0;
+        if (p.howl && p.howl.pannerAttr) p.howl.pannerAttr({ maxDistance: 100000, rolloffFactor: 0 });
+        if (p.pannerNode) p.pannerNode.maxDistance = 100000;
     },
 
     setLoop: function (index, loopVal) {
         var p = players[index];
         if (!p) return;
         p.loop = !!loopVal;
-        if (p.type === 'youtube') { if (p.ytPlayer && p.ytPlayer.setLoop) p.ytPlayer.setLoop(!!loopVal); }
-        else if (p.spatial) p.spatial.audio.loop = !!loopVal;
-        else if (p.howl) p.howl.loop(!!loopVal);
+
+        if (p.type === 'youtube') {
+            if (p.ytPlayer) p.ytPlayer.setLoop(!!loopVal);
+        } else if (p.type === 'spatialstream' || p.type === 'mediastream') {
+            if (p.audio) p.audio.loop = !!loopVal;
+        } else if (p.howl) {
+            p.howl.loop(!!loopVal);
+        }
     },
 
     setTimestamp: function (index, time) {
         var p = players[index];
         if (!p) return;
-        var t = Math.max(0, Number(time) || 0);
-        if (p.type === 'youtube') { if (p.ytPlayer) p.ytPlayer.seekTo(t, true); else p._pendingSeek = t; }
-        else if (p.type === 'soundcloud') { if (p.scWidget) p.scWidget.seekTo(t * 1000); else p._pendingSeek = t; }
-        else if (p.spatial) applyMediaTimestamp(p.spatial, t, p.loop);
-        else if (p.howl) {
-            try { p.howl.seek(t); } catch (e) { p._pendingSeek = t; }
+        time = Math.max(0, Number(time) || 0);
+
+        if (p.type === 'youtube') {
+            if (p.ytPlayer) p.ytPlayer.seekTo(time, true);
+        } else if (p.type === 'soundcloud') {
+            if (p.scWidget) p.scWidget.seekTo(time * 1000);
+        } else if (p.type === 'spatialstream' || p.type === 'mediastream') {
+            if (p.audio) {
+                var shouldResume = p.playing && !p.paused;
+                var keepVolume = p.audio.volume;
+                p.audio.pause();
+                seekMediaAndThen(p.audio, time, p.loop, function () {
+                    if (!p.audio) return;
+                    p.audio.volume = keepVolume;
+                    if (shouldResume && !p.paused) {
+                        var promise = p.audio.play();
+                        if (promise && promise.catch) promise.catch(function () {});
+                    }
+                });
+            }
+        } else if (p.howl) {
+            seekHowlWhenReady(p.howl, time, p.loop);
         }
     },
 
     fadeIn: function (index, duration, targetVolume) {
         var p = players[index];
         if (!p) return;
-        var target = clamp(targetVolume, 0, 1);
-        duration = Math.max(1, Number(duration) || 1000);
-        if (p.spatial && p.spatial.gain) {
-            var g = p.spatial.gain.gain, ctx = p.spatial.ctx;
-            g.cancelScheduledValues(ctx.currentTime);
-            setAudioParam(g, 0, ctx);
-            g.linearRampToValueAtTime(target, ctx.currentTime + duration / 1000);
-            return;
-        }
-        if (p.howl) { p.howl.fade(0, target, duration); return; }
-        this._fadeWidget(p, 0, target, duration);
+        p.vol = p.maxVol = Math.max(0, Math.min(1, Number(targetVolume) || 0));
+        animateFadeMultiplier(p, 0.0, 1.0, duration);
     },
 
     fadeOut: function (index, duration) {
         var p = players[index];
         if (!p) return;
-        duration = Math.max(1, Number(duration) || 1000);
-        if (p.spatial && p.spatial.gain) {
-            var g = p.spatial.gain.gain, ctx = p.spatial.ctx;
-            g.cancelScheduledValues(ctx.currentTime);
-            g.setValueAtTime(g.value, ctx.currentTime);
-            g.linearRampToValueAtTime(0, ctx.currentTime + duration / 1000);
-            return;
-        }
-        if (p.howl) { p.howl.fade(p.howl.volume(), 0, duration); return; }
-        this._fadeWidget(p, p.vol || 1, 0, duration);
-    },
-
-    _fadeWidget: function (p, from, to, duration) {
-        var steps = 20, step = 0;
-        var iv = setInterval(function () {
-            step += 1;
-            var v = from + (to - from) * (step / steps);
-            setPlayerVolume(p, v);
-            if (step >= steps) clearInterval(iv);
-        }, duration / steps);
+        animateFadeMultiplier(p, (p._fadeMult !== undefined ? p._fadeMult : 1.0), 0.0, duration);
     },
 
     stopAll: function () {
-        Object.keys(players).forEach(function (k) { cleanupPlayer(parseInt(k, 10)); });
+        Object.keys(players).forEach(function (k) { cleanupPlayer(k); });
     },
 };
 

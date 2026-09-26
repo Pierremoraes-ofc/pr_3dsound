@@ -1,5 +1,5 @@
 --[[
-    pr_3dsound — test_commands.lua  v3.8
+    pr_3dsound — test_commands.lua  v4.0.0-fixed
     Comandos de teste via chat. REMOVA EM PRODUÇÃO!
 
     ╔══════════════════════════════════════════════════════════════════════╗
@@ -271,7 +271,7 @@ end, false)
 -- ─── /sound ──────────────────────────────────────────────────────────────────
 
 RegisterCommand('sound', function()
-    inf('======= pr_3dsound v3.8 =======')
+    inf('======= pr_3dsound v4.0.0-fixed =======')
     inf('^3/play      ^7<url> [vol] [raio]    → URL 3D na sua posição')
     inf('^3/play2d    ^7<url> [vol]           → URL 2D global')
     inf('^3/playfile  ^7<arq> [vol] [raio]    → arquivo local 3D')
@@ -292,5 +292,5 @@ end, false)
 
 AddEventHandler('playerSpawned', function()
     Citizen.Wait(3000)
-    inf('pr_3dsound v3.8 ativo. ^3/sound^7 para ver os comandos.')
+    inf('pr_3dsound v4.0.0-fixed ativo. ^3/sound^7 para ver os comandos.')
 end)

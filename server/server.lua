@@ -1,209 +1,175 @@
 --[[
-    pr_3dsound — server.lua v4.0
+    pr_3dsound — server.lua  v4.0.0-fixed
 
-    v4.0 goals:
-      * persistent positional emitters with late stream-in / stream-out
-      * attached emitters follow networked entities server-side
-      * playback timestamp is preserved when a player enters the radius later
-      * client-triggered control is restricted to sounds owned by that client
-      * global/broadcast control should be done through server-side exports
+    Estado autoritativo + streaming dinâmico de emitters por proximidade.
+    Mantém os exports server-side da v3.x.
 
-    Public server exports are intentionally kept compatible with v3.x.
+    Segurança:
+      * Use exports server-side para controlar sons.
+      * TriggerServerEvent de controle é bloqueado por padrão.
+      * Para liberar um player: ACE "pr_3dsound.control".
+      * Compatibilidade legada (não recomendado):
+          setr pr_3dsound_allow_client_events 1
 ]]
 
 local Sounds = {}
-local SERVER_INDEX_BASE = 100000
+local NextServerIndex = 100000 -- evita colisão com índices de sons locais do client
 
 local CFG = {
-    STREAM_INTERVAL_MS = 750,
-    STREAM_IN_PADDING = 5.0,
-    STREAM_OUT_PADDING = 15.0,
-    MAX_RADIUS = 1000.0,
-    MAX_CLIENT_RADIUS = 100.0,
-    CLIENT_EVENT_COOLDOWN_MS = 200,
-    CLIENT_MAX_SOURCE_DISTANCE = 25.0,
-    CLIENT_BROADCAST_ACE = 'pr_3dsound.broadcast',
+    STREAM_INTERVAL_MS     = math.max(200, GetConvarInt('pr_3dsound_stream_interval', 1000)),
+    STREAM_HYSTERESIS      = tonumber(GetConvar('pr_3dsound_stream_hysteresis', '8.0')) or 8.0,
+    MAX_RADIUS             = tonumber(GetConvar('pr_3dsound_max_radius', '1000.0')) or 1000.0,
+    ENTITY_MISSING_TIMEOUT = math.max(2000, GetConvarInt('pr_3dsound_entity_timeout', 10000)),
+    ENTITY_MISSING_GRACE   = math.max(500, GetConvarInt('pr_3dsound_entity_grace', 2500)),
+    ALLOW_CLIENT_EVENTS    = GetConvarInt('pr_3dsound_allow_client_events', 0) == 1,
+    CLIENT_ACE             = GetConvar('pr_3dsound_client_ace', 'pr_3dsound.control'),
 }
 
-local clientCooldown = {}
+local deniedOnce = {}
 
-local function nowMs()
-    return GetGameTimer()
-end
+-- =============================================
+--  UTILIDADES
+-- =============================================
 
 local function clamp(v, lo, hi)
     v = tonumber(v) or lo
-    if v < lo then return lo end
-    if v > hi then return hi end
-    return v
+    return math.max(lo, math.min(hi, v))
 end
 
-local function toCoords(value)
-    if type(value) == 'vector3' then
-        return vector3(value.x + 0.0, value.y + 0.0, value.z + 0.0)
-    end
-    if type(value) == 'table' and tonumber(value.x) and tonumber(value.y) and tonumber(value.z) then
-        return vector3(value.x + 0.0, value.y + 0.0, value.z + 0.0)
-    end
-end
-
-local function packCoords(value)
-    local c = toCoords(value)
-    if not c then return nil end
-    return { x = c.x, y = c.y, z = c.z }
+local function toCoords(coords)
+    if not coords then return nil end
+    local x = tonumber(coords.x or coords[1])
+    local y = tonumber(coords.y or coords[2])
+    local z = tonumber(coords.z or coords[3])
+    if not x or not y or not z then return nil end
+    return vector3(x, y, z)
 end
 
 local function normalizeOffset(offset)
-    if type(offset) ~= 'table' then return { x = 0.0, y = 0.0, z = 0.0 } end
+    if not offset then return { x = 0.0, y = 0.0, z = 0.0 } end
     return {
-        x = tonumber(offset.x) or 0.0,
-        y = tonumber(offset.y) or 0.0,
-        z = tonumber(offset.z) or 0.0,
+        x = tonumber(offset.x or offset[1]) or 0.0,
+        y = tonumber(offset.y or offset[2]) or 0.0,
+        z = tonumber(offset.z or offset[3]) or 0.0,
     }
+end
+
+local function validName(name)
+    return type(name) == 'string' and #name > 0 and #name <= 128
 end
 
 local function validUrl(url)
-    return type(url) == 'string' and #url <= 2048 and url:match('^https?://') ~= nil
+    if type(url) ~= 'string' or #url == 0 or #url > 2048 then return false end
+    local lower = url:lower()
+    return lower:sub(1, 7) == 'http://' or lower:sub(1, 8) == 'https://'
 end
 
-local function validSoundName(name)
-    if type(name) ~= 'string' or name == '' or #name > 240 then return false end
-    if name:find('%.%.', 1, true) then return false end
-    if name:sub(1, 1) == '/' or name:sub(1, 1) == '\\' then return false end
+local function validSoundPath(path)
+    if type(path) ~= 'string' or #path == 0 or #path > 256 then return false end
+    if path:find('..', 1, true) or path:sub(1, 1) == '/' or path:sub(1, 1) == '\\' then return false end
     return true
-end
-
-local function getNextIndex(uniqueId)
-    if uniqueId then
-        for index, sound in pairs(Sounds) do
-            if sound.uniqueId == uniqueId then return index end
-        end
-    end
-
-    local i = SERVER_INDEX_BASE + 1
-    while Sounds[i] ~= nil do i = i + 1 end
-    return i
 end
 
 local function getIndexByUniqueId(uniqueId)
-    for index, sound in pairs(Sounds) do
-        if sound.uniqueId == uniqueId then return index end
+    if uniqueId == nil then return nil end
+    for k, v in pairs(Sounds) do
+        if v.uniqueId == uniqueId then return k end
     end
+    return nil
 end
 
-local function playerCoords(src)
-    src = tonumber(src)
-    if not src then return nil end
-    local ped = GetPlayerPed(src)
-    if not ped or ped == 0 or not DoesEntityExist(ped) then return nil end
-    return GetEntityCoords(ped)
+local function eachListener(sound, fn)
+    if not sound.listeners then return end
+    for player, _ in pairs(sound.listeners) do fn(player) end
 end
 
-local function elapsedSeconds(sound)
-    if sound.paused then
-        return math.max(0.0, sound.pausedTimestamp or 0.0)
-    end
-    local startedAt = sound.startedAtMs or nowMs()
-    return math.max(0.0, (nowMs() - startedAt) / 1000.0)
+local function playbackOffset(sound)
+    local base = tonumber(sound.seekBase) or 0.0
+    if sound.paused then return tonumber(sound.pausedOffset) or base end
+
+    local startedAt = tonumber(sound.startedAt) or GetGameTimer()
+    local elapsedMs = GetGameTimer() - startedAt
+    if elapsedMs < 0 then elapsedMs = 0 end
+    return math.max(0.0, base + (elapsedMs / 1000.0))
 end
 
-local function resetClock(sound, seconds)
-    seconds = math.max(0.0, tonumber(seconds) or 0.0)
-    sound.startedAtMs = nowMs() - math.floor(seconds * 1000.0)
-    sound.pausedTimestamp = sound.paused and seconds or nil
-end
-
-local function canClientMutate(src, sound)
-    return sound and sound.ownerSource and tonumber(sound.ownerSource) == tonumber(src)
-end
-
-local function clientRateAllowed(src)
-    local now = nowMs()
-    local last = clientCooldown[src] or 0
-    if now - last < CFG.CLIENT_EVENT_COOLDOWN_MS then return false end
-    clientCooldown[src] = now
-    return true
-end
-
-local function hasBroadcastAce(src)
-    return src == 0 or IsPlayerAceAllowed(src, CFG.CLIENT_BROADCAST_ACE)
-end
-
-local function clientIdAvailable(src, uniqueId)
-    if not uniqueId then return true end
-    local index = getIndexByUniqueId(uniqueId)
-    if not index then return true end
-    local sound = Sounds[index]
-    return sound and sound.ownerSource and tonumber(sound.ownerSource) == tonumber(src)
-end
-
-local function coordsNearClient(src, coords)
-    local pc = playerCoords(src)
-    local c = toCoords(coords)
-    if not pc or not c then return false end
-    return #(pc - c) <= CFG.CLIENT_MAX_SOURCE_DISTANCE
-end
-
-local function entityCoords(sound)
-    if not sound.attachNetId then return toCoords(sound.coords) end
-
+local function getAttachedEntity(sound)
+    if not sound.attachNetId then return nil end
     local entity = NetworkGetEntityFromNetworkId(sound.attachNetId)
-    if entity and entity ~= 0 and DoesEntityExist(entity) then
-        local c = GetEntityCoords(entity)
-        -- Keep attached emitters inside the same OneSync routing bucket as the entity.
-        if GetEntityRoutingBucket then sound.routingBucket = GetEntityRoutingBucket(entity) end
-        -- Server proximity uses entity origin; clients apply the local attach offset.
-        sound.coords = vector3(c.x, c.y, c.z)
-        return sound.coords
-    end
-
-    return toCoords(sound.coords)
+    if entity and entity ~= 0 and DoesEntityExist(entity) then return entity end
+    return nil
 end
 
-local function shouldHear(sound, src, currentlyListening)
-    if sound.targetSource and sound.targetSource ~= -1 then
-        return tonumber(src) == tonumber(sound.targetSource)
+local function refreshSoundCoords(sound)
+    local entity = getAttachedEntity(sound)
+    if entity then
+        local c = GetEntityCoords(entity)
+        local o = sound.attachOffset or { x = 0.0, y = 0.0, z = 0.0 }
+        sound.coords = vector3(c.x + o.x, c.y + o.y, c.z + o.z)
+        sound.routingBucket = GetEntityRoutingBucket(entity)
+        sound.entityMissingSince = nil
+        return true
     end
 
-    if sound.routingBucket ~= nil and GetPlayerRoutingBucket and GetPlayerRoutingBucket(src) ~= sound.routingBucket then
+    if sound.attachNetId then
+        sound.entityMissingSince = sound.entityMissingSince or GetGameTimer()
         return false
     end
 
-    if sound.is2D then return true end
-
-    local sc = toCoords(sound.coords)
-    local pc = playerCoords(src)
-    if not sc or not pc then return false end
-
-    local radius = tonumber(sound.radius) or 50.0
-    local padding = currentlyListening and CFG.STREAM_OUT_PADDING or CFG.STREAM_IN_PADDING
-    return #(pc - sc) <= (radius + padding)
+    return sound.coords ~= nil
 end
 
-local function makeListenerToken(index, src)
-    return ('%s:%s:%s:%s'):format(index, src, nowMs(), math.random(100000, 999999))
+local function eligibleTarget(sound, player)
+    if sound.targetSource and sound.targetSource ~= player then return false end
+    if sound.routingBucket ~= nil and GetPlayerRoutingBucket(player) ~= sound.routingBucket then return false end
+    return true
 end
 
-local function sendPlay(index, sound, src)
-    local coords = entityCoords(sound) or vector3(0.0, 0.0, 0.0)
-    local token = makeListenerToken(index, src)
-    sound.listeners[src] = { token = token }
+local function distanceSq(a, b)
+    local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
+    return dx * dx + dy * dy + dz * dz
+end
 
-    local options = {
-        startTime = elapsedSeconds(sound),
+local function clientCanControl(src)
+    if not src or src == 0 then return true end
+    if CFG.ALLOW_CLIENT_EVENTS then return true end
+    if IsPlayerAceAllowed(src, CFG.CLIENT_ACE) then return true end
+
+    if not deniedOnce[src] then
+        deniedOnce[src] = true
+        print(('[pr_3dsound] Bloqueado TriggerServerEvent não autorizado do player %s. Use exports server-side ou ACE "%s".'):format(src, CFG.CLIENT_ACE))
+    end
+    return false
+end
+
+local function playerPosition(player)
+    local ped = GetPlayerPed(player)
+    if not ped or ped == 0 then return nil end
+    local c = GetEntityCoords(ped)
+    return vector3(c.x, c.y, c.z)
+end
+
+local function buildOptions(sound)
+    return {
         serverManaged = true,
-        endToken = token,
+        startAt = playbackOffset(sound),
         paused = sound.paused == true,
     }
+end
 
-    if sound.kind == 'local' then
-        TriggerClientEvent('pr_3dsound:client:play', src,
-            index, packCoords(coords), sound.file, sound.volume, sound.radius,
-            sound.uniqueId, sound.loop, nil, options)
-    elseif sound.is2D then
-        TriggerClientEvent('pr_3dsound:client:playUrl', src,
+local function sendSoundToPlayer(index, sound, player)
+    player = tonumber(player)
+    if not player or GetPlayerName(player) == nil then return false end
+
+    sound.listeners = sound.listeners or {}
+    if sound.listeners[player] then return true end
+
+    local options = buildOptions(sound)
+
+    if sound.is2D then
+        TriggerClientEvent('pr_3dsound:client:playUrl', player,
             index, sound.uniqueId, sound.url, sound.volume, sound.loop, options)
-    else
+    elseif sound.isUrl then
         local attachData = nil
         if sound.attachNetId then
             attachData = {
@@ -211,280 +177,459 @@ local function sendPlay(index, sound, src)
                 offset = sound.attachOffset or { x = 0.0, y = 0.0, z = 0.0 },
             }
         end
-        TriggerClientEvent('pr_3dsound:client:playUrlPos', src,
-            index, sound.uniqueId, sound.url, sound.volume, packCoords(coords), sound.radius,
-            sound.loop, options, attachData)
+
+        TriggerClientEvent('pr_3dsound:client:playUrlPos', player,
+            index, sound.uniqueId, sound.url, sound.volume, sound.coords,
+            sound.radius, sound.loop, options, attachData)
+    else
+        TriggerClientEvent('pr_3dsound:client:play', player,
+            index, sound.coords, sound.soundName, sound.volume, sound.radius,
+            sound.uniqueId, sound.loop, nil, options)
     end
 
-    if sound.paused then
-        TriggerClientEvent('pr_3dsound:client:pause', src, index)
+    sound.listeners[player] = true
+    return true
+end
+
+local function streamOutPlayer(index, sound, player)
+    if not sound.listeners or not sound.listeners[player] then return end
+    TriggerClientEvent('pr_3dsound:client:stop', player, index)
+    sound.listeners[player] = nil
+end
+
+local function streamOutAll(index, sound)
+    if not sound.listeners then return end
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:stop', player, index)
+    end)
+    sound.listeners = {}
+end
+
+local function stopIndex(index)
+    local sound = Sounds[index]
+    if not sound then return false end
+
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:stop', player, index)
+    end)
+
+    Sounds[index] = nil
+    return true
+end
+
+local function replaceExisting(uniqueId)
+    local existing = getIndexByUniqueId(uniqueId)
+    if existing then stopIndex(existing) end
+end
+
+local function allocateIndex()
+    NextServerIndex = NextServerIndex + 1
+    return NextServerIndex
+end
+
+local function makeSound(uniqueId, data)
+    replaceExisting(uniqueId)
+    local index = allocateIndex()
+    data.uniqueId = uniqueId
+    data.listeners = {}
+    data.startedAt = GetGameTimer()
+    data.createdAt = data.startedAt
+    data.seekBase = 0.0
+    data.paused = false
+    Sounds[index] = data
+    return index, data
+end
+
+local function syncSpatialPlayer(index, sound, player, pCoords)
+    if not eligibleTarget(sound, player) then
+        streamOutPlayer(index, sound, player)
+        return
+    end
+
+    if not sound.coords or not pCoords then return end
+
+    local radius = sound.radius or 30.0
+    local listening = sound.listeners and sound.listeners[player]
+    local threshold = listening and (radius + CFG.STREAM_HYSTERESIS) or radius
+    local inside = distanceSq(sound.coords, pCoords) <= (threshold * threshold)
+
+    if inside and not listening then
+        sendSoundToPlayer(index, sound, player)
+    elseif not inside and listening then
+        streamOutPlayer(index, sound, player)
     end
 end
 
-local function streamOut(index, sound, src)
-    if sound.listeners[src] then
-        TriggerClientEvent('pr_3dsound:client:stop', src, index)
-        sound.listeners[src] = nil
-    end
-end
+local function syncPlayer(player)
+    player = tonumber(player)
+    if not player then return end
 
-local function syncSound(index, sound)
-    if not sound then return end
-
-    -- Resolve attached entity once per sync pass (instead of once per player).
-    if not sound.is2D then entityCoords(sound) end
-
-    for _, player in ipairs(GetPlayers()) do
-        local src = tonumber(player)
-        if src then
-            local listening = sound.listeners[src] ~= nil
-            local hear = shouldHear(sound, src, listening)
-            if hear and not listening then
-                sendPlay(index, sound, src)
-            elseif not hear and listening then
-                streamOut(index, sound, src)
+    local pCoords = playerPosition(player)
+    for index, sound in pairs(Sounds) do
+        if sound.is2D then
+            if eligibleTarget(sound, player) then sendSoundToPlayer(index, sound, player) end
+        else
+            local entityOk = refreshSoundCoords(sound)
+            if sound.attachNetId and not entityOk then
+                -- Durante troca de ownership/entrada em veículo o Network ID pode
+                -- sumir por poucos ticks. Preserve listeners existentes nessa janela
+                -- para não pausar/recriar a música. Novos listeners aguardam resolver.
+                local missingFor = sound.entityMissingSince and (GetGameTimer() - sound.entityMissingSince) or 0
+                if missingFor >= CFG.ENTITY_MISSING_GRACE then
+                    streamOutPlayer(index, sound, player)
+                end
+            else
+                syncSpatialPlayer(index, sound, player, pCoords)
             end
         end
     end
-
-    for src, _ in pairs(sound.listeners) do
-        if not GetPlayerName(src) then
-            sound.listeners[src] = nil
-        end
-    end
 end
 
-local function broadcastToListeners(sound, eventName, ...)
-    for src, _ in pairs(sound.listeners) do
-        TriggerClientEvent(eventName, src, ...)
-    end
-end
-
-local function storeSound(index, data)
-    local previous = Sounds[index]
-    if previous then
-        broadcastToListeners(previous, 'pr_3dsound:client:stop', index)
-    end
-    data.listeners = data.listeners or {}
-    data.startedAtMs = data.startedAtMs or nowMs()
-    data.paused = data.paused == true
-    if data.kind == 'local' and not data.loop and not data.expiresAtMs then
-        data.expiresAtMs = nowMs() + 120000 -- safety cleanup for one-shot local effects
-    end
-    Sounds[index] = data
-    syncSound(index, data)
-end
-
--- ============================================================
--- Server API
--- ============================================================
+-- =============================================
+--  PLAY — arquivo local em html/sounds/
+-- =============================================
 
 local function Play(coords, soundName, volume, radius, uniqueId, resourceName, loop)
-    local c = toCoords(coords)
-    if not c or not validSoundName(soundName) then return nil end
+    coords = toCoords(coords)
+    if not coords or not validSoundPath(soundName) then return nil end
 
-    local index = getNextIndex(uniqueId)
-    uniqueId = uniqueId or tostring(index)
+    uniqueId = uniqueId or ('snd_%d'):format(NextServerIndex + 1)
     radius = clamp(radius or 30.0, 1.0, CFG.MAX_RADIUS)
     volume = clamp(volume or 1.0, 0.0, 1.0)
     loop = loop == true
 
     local finalName = soundName
     if resourceName and resourceName ~= '' then
-        if not validSoundName(resourceName) then return nil end
-        finalName = resourceName .. '/' .. soundName
+        if not validSoundPath(tostring(resourceName)) then return nil end
+        finalName = tostring(resourceName) .. '/' .. soundName
     end
 
-    storeSound(index, {
-        kind = 'local', uniqueId = uniqueId, file = finalName,
-        coords = c, radius = radius, volume = volume,
-        isUrl = false, is2D = false, loop = loop,
-        -- One-shot local effects should not suddenly replay for players who arrive late.
-        streamPersistent = loop,
+    local index, sound = makeSound(uniqueId, {
+        coords = coords,
+        radius = radius,
+        volume = volume,
+        isUrl = false,
+        is2D = false,
+        soundName = finalName,
+        loop = loop,
     })
 
-    -- For a non-loop local effect, freeze the initial audience after the first sync.
-    if not loop then Sounds[index].targetSnapshot = true end
+    for _, playerStr in ipairs(GetPlayers()) do
+        local player = tonumber(playerStr)
+        syncSpatialPlayer(index, sound, player, playerPosition(player))
+    end
+
     return uniqueId
 end
 
-local function PlayUrl(targetSource, name, url, volume, loop)
-    if not name or not validUrl(url) then return nil end
-    local index = getNextIndex(name)
-    storeSound(index, {
-        kind = 'url', uniqueId = name, url = url,
-        volume = clamp(volume or 1.0, 0.0, 1.0),
-        isUrl = true, is2D = true, loop = loop == true,
-        targetSource = (targetSource and targetSource ~= -1) and tonumber(targetSource) or nil,
+-- =============================================
+--  PLAY URL — 2D
+-- =============================================
+
+local function PlayUrl(sourcePlayer, name, url, volume, loop)
+    if not validName(name) or not validUrl(url) then return nil end
+
+    volume = clamp(volume or 1.0, 0.0, 1.0)
+    loop = loop == true
+    local target = (sourcePlayer and tonumber(sourcePlayer) ~= -1) and tonumber(sourcePlayer) or nil
+
+    local index, sound = makeSound(name, {
+        isUrl = true,
+        is2D = true,
+        url = url,
+        volume = volume,
+        loop = loop,
+        targetSource = target,
     })
+
+    if target then
+        sendSoundToPlayer(index, sound, target)
+    else
+        for _, playerStr in ipairs(GetPlayers()) do
+            sendSoundToPlayer(index, sound, tonumber(playerStr))
+        end
+    end
+
     return name
 end
 
-local function PlayUrlPos(targetSource, name, url, volume, coords, radius, loop)
-    local c = toCoords(coords)
-    if not name or not validUrl(url) or not c then return nil end
-    local index = getNextIndex(name)
-    storeSound(index, {
-        kind = 'url', uniqueId = name, url = url, coords = c,
-        volume = clamp(volume or 1.0, 0.0, 1.0),
-        radius = clamp(radius or 50.0, 1.0, CFG.MAX_RADIUS),
-        isUrl = true, is2D = false, loop = loop == true,
-        targetSource = (targetSource and targetSource ~= -1) and tonumber(targetSource) or nil,
+-- =============================================
+--  PLAY URL POS — emitter persistente
+-- =============================================
+
+local function PlayUrlPos(sourcePlayer, name, url, volume, coords, radius, loop, routingBucket)
+    coords = toCoords(coords)
+    if not coords or not validName(name) or not validUrl(url) then return nil end
+
+    radius = clamp(radius or 50.0, 1.0, CFG.MAX_RADIUS)
+    volume = clamp(volume or 1.0, 0.0, 1.0)
+    loop = loop == true
+    local target = (sourcePlayer and tonumber(sourcePlayer) ~= -1) and tonumber(sourcePlayer) or nil
+    routingBucket = routingBucket ~= nil and tonumber(routingBucket) or nil
+
+    local index, sound = makeSound(name, {
+        coords = coords,
+        radius = radius,
+        volume = volume,
+        isUrl = true,
+        is2D = false,
+        url = url,
+        loop = loop,
+        targetSource = target,
+        routingBucket = routingBucket,
     })
+
+    for _, playerStr in ipairs(GetPlayers()) do
+        local player = tonumber(playerStr)
+        syncSpatialPlayer(index, sound, player, playerPosition(player))
+    end
+
     return name
 end
 
-local function PlayUrlAttached(targetSource, name, url, volume, entityNetId, radius, loop)
-    if not name or not validUrl(url) or not tonumber(entityNetId) then return nil end
-    local index = getNextIndex(name)
-    local entity = NetworkGetEntityFromNetworkId(tonumber(entityNetId))
-    local coords = (entity and entity ~= 0 and DoesEntityExist(entity)) and GetEntityCoords(entity) or vector3(0.0, 0.0, 0.0)
+-- =============================================
+--  PLAY URL ATTACHED — emitter em entity
+-- =============================================
 
-    storeSound(index, {
-        kind = 'url', uniqueId = name, url = url, coords = coords,
-        volume = clamp(volume or 1.0, 0.0, 1.0),
-        radius = clamp(radius or 30.0, 1.0, CFG.MAX_RADIUS),
-        isUrl = true, is2D = false,
-        loop = (loop == nil) and true or loop == true,
-        targetSource = (targetSource and targetSource ~= -1) and tonumber(targetSource) or nil,
-        attachNetId = tonumber(entityNetId),
+local function PlayUrlAttached(sourcePlayer, name, url, volume, entityNetId, radius, loop)
+    entityNetId = tonumber(entityNetId)
+    if not entityNetId or entityNetId <= 0 or not validName(name) or not validUrl(url) then return nil end
+
+    radius = clamp(radius or 30.0, 1.0, CFG.MAX_RADIUS)
+    volume = clamp(volume or 1.0, 0.0, 1.0)
+    loop = (loop == nil) and true or loop == true
+    local target = (sourcePlayer and tonumber(sourcePlayer) ~= -1) and tonumber(sourcePlayer) or nil
+
+    local entity = NetworkGetEntityFromNetworkId(entityNetId)
+    local exists = entity and entity ~= 0 and DoesEntityExist(entity)
+    local coords = exists and GetEntityCoords(entity) or vector3(0.0, 0.0, 0.0)
+    local bucket = exists and GetEntityRoutingBucket(entity) or nil
+
+    local index, sound = makeSound(name, {
+        coords = coords,
+        radius = radius,
+        volume = volume,
+        isUrl = true,
+        is2D = false,
+        url = url,
+        loop = loop,
+        targetSource = target,
+        attachNetId = entityNetId,
         attachOffset = { x = 0.0, y = 0.0, z = 0.0 },
+        routingBucket = bucket,
     })
+
+    refreshSoundCoords(sound)
+
+    for _, playerStr in ipairs(GetPlayers()) do
+        local player = tonumber(playerStr)
+        syncSpatialPlayer(index, sound, player, playerPosition(player))
+    end
+
     return name
 end
+
+-- =============================================
+--  CONTROLES
+-- =============================================
 
 local function AttachToEntity(uniqueId, entityNetId, offset)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
-    if not sound or not tonumber(entityNetId) then return false end
-    sound.attachNetId = tonumber(entityNetId)
+    local sound = index and Sounds[index] or nil
+    entityNetId = tonumber(entityNetId)
+    if not sound or not entityNetId or entityNetId <= 0 or sound.is2D then return false end
+
+    sound.attachNetId = entityNetId
     sound.attachOffset = normalizeOffset(offset)
-    entityCoords(sound)
-    broadcastToListeners(sound, 'pr_3dsound:client:attachToEntity', index, sound.attachNetId, sound.attachOffset)
-    syncSound(index, sound)
+    refreshSoundCoords(sound)
+
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:attachToEntity', player, index, entityNetId, sound.attachOffset)
+    end)
+
     return true
 end
 
 local function DetachEntity(uniqueId)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
+    local sound = index and Sounds[index] or nil
     if not sound then return false end
-    entityCoords(sound)
+
+    refreshSoundCoords(sound)
     sound.attachNetId = nil
     sound.attachOffset = nil
-    broadcastToListeners(sound, 'pr_3dsound:client:detachEntity', index)
+    sound.routingBucket = nil
+    sound.entityMissingSince = nil
+
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:detachEntity', player, index)
+    end)
+
     return true
 end
 
 local function Pause(uniqueId)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
-    if not sound or sound.paused then return sound ~= nil end
-    sound.pausedTimestamp = elapsedSeconds(sound)
-    sound.paused = true
-    broadcastToListeners(sound, 'pr_3dsound:client:pause', index)
+    local sound = index and Sounds[index] or nil
+    if not sound then return false end
+
+    if not sound.paused then
+        sound.pausedOffset = playbackOffset(sound)
+        sound.paused = true
+    end
+
+    local exactOffset = tonumber(sound.pausedOffset) or playbackOffset(sound)
+    eachListener(sound, function(player)
+        -- Uma única mensagem evita corrida NUI entre seek e pause.
+        TriggerClientEvent('pr_3dsound:client:pauseAt', player, index, exactOffset)
+    end)
+
     return true
 end
 
 local function Resume(uniqueId)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
+    local sound = index and Sounds[index] or nil
     if not sound then return false end
+
+    local exactOffset = sound.paused and (tonumber(sound.pausedOffset) or 0.0) or playbackOffset(sound)
     if sound.paused then
-        local t = sound.pausedTimestamp or 0.0
+        sound.seekBase = exactOffset
+        sound.startedAt = GetGameTimer()
+        sound.pausedOffset = nil
         sound.paused = false
-        sound.pausedTimestamp = nil
-        resetClock(sound, t)
     end
-    broadcastToListeners(sound, 'pr_3dsound:client:resume', index)
+
+    eachListener(sound, function(player)
+        -- Resume atômico: o NUI só executa play() depois que o seek foi aplicado.
+        TriggerClientEvent('pr_3dsound:client:resumeAt', player, index, exactOffset)
+    end)
+
     return true
 end
 
 local function Stop(uniqueId)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
-    if not sound then return false end
-    broadcastToListeners(sound, 'pr_3dsound:client:stop', index)
-    Sounds[index] = nil
-    return true
+    if not index then return false end
+    return stopIndex(index)
 end
 
 local function StopAll()
-    for index, sound in pairs(Sounds) do
-        broadcastToListeners(sound, 'pr_3dsound:client:stop', index)
-    end
-    Sounds = {}
+    local indexes = {}
+    for index, _ in pairs(Sounds) do indexes[#indexes + 1] = index end
+    for i = 1, #indexes do stopIndex(indexes[i]) end
+    return true
 end
 
 local function UpdateCoords(uniqueId, coords)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
-    local c = toCoords(coords)
-    if not sound or not c then return false end
-    sound.coords = c
-    broadcastToListeners(sound, 'pr_3dsound:client:updateCoords', index, packCoords(c))
-    syncSound(index, sound)
+    local sound = index and Sounds[index] or nil
+    coords = toCoords(coords)
+    if not sound or not coords or sound.is2D then return false end
+
+    sound.coords = coords
+    sound.attachNetId = nil
+    sound.attachOffset = nil
+    sound.routingBucket = nil
+    sound.entityMissingSince = nil
+
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:updateCoords', player, index, coords)
+    end)
+
     return true
 end
 
 local function SetVolume(uniqueId, volume)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
+    local sound = index and Sounds[index] or nil
     if not sound then return false end
+
     sound.volume = clamp(volume, 0.0, 1.0)
-    broadcastToListeners(sound, 'pr_3dsound:client:setVolume', index, sound.volume)
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:setVolume', player, index, sound.volume)
+    end)
     return true
 end
 
 local function SetVolumeMax(uniqueId, volume)
-    return SetVolume(uniqueId, volume)
+    local index = getIndexByUniqueId(uniqueId)
+    local sound = index and Sounds[index] or nil
+    if not sound then return false end
+
+    sound.volume = clamp(volume, 0.0, 1.0)
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:setVolumeMax', player, index, sound.volume)
+    end)
+    return true
 end
 
 local function SetDistance(uniqueId, dist)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
-    if not sound then return false end
+    local sound = index and Sounds[index] or nil
+    if not sound or sound.is2D then return false end
+
     sound.radius = clamp(dist, 1.0, CFG.MAX_RADIUS)
-    broadcastToListeners(sound, 'pr_3dsound:client:setDistance', index, sound.radius)
-    syncSound(index, sound)
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:setDistance', player, index, sound.radius)
+    end)
     return true
 end
 
 local function SetLoop(uniqueId, loopVal)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
+    local sound = index and Sounds[index] or nil
     if not sound then return false end
+
     sound.loop = loopVal == true
-    broadcastToListeners(sound, 'pr_3dsound:client:setLoop', index, sound.loop)
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:setLoop', player, index, sound.loop)
+    end)
     return true
 end
 
-local function SetTimestamp(uniqueId, seconds)
+local function SetTimestamp(uniqueId, time)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
+    local sound = index and Sounds[index] or nil
     if not sound then return false end
-    seconds = math.max(0.0, tonumber(seconds) or 0.0)
-    resetClock(sound, seconds)
-    broadcastToListeners(sound, 'pr_3dsound:client:setTimestamp', index, seconds)
+
+    time = math.max(0.0, tonumber(time) or 0.0)
+    sound.seekBase = time
+    sound.startedAt = GetGameTimer()
+    if sound.paused then sound.pausedOffset = time end
+
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:setTimestamp', player, index, time)
+    end)
     return true
 end
 
 local function FadeIn(uniqueId, duration, targetVolume)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
+    local sound = index and Sounds[index] or nil
     if not sound then return false end
+
+    duration = math.max(0, tonumber(duration) or 1000)
     targetVolume = clamp(targetVolume or 1.0, 0.0, 1.0)
     sound.volume = targetVolume
-    broadcastToListeners(sound, 'pr_3dsound:client:fadeIn', index, tonumber(duration) or 1000, targetVolume)
+
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:fadeIn', player, index, duration, targetVolume)
+    end)
     return true
 end
 
 local function FadeOut(uniqueId, duration)
     local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
+    local sound = index and Sounds[index] or nil
     if not sound then return false end
-    sound.volume = 0.0
-    broadcastToListeners(sound, 'pr_3dsound:client:fadeOut', index, tonumber(duration) or 1000)
+
+    duration = math.max(0, tonumber(duration) or 1000)
+    sound.volume = 0.0 -- novos listeners durante/depois do fade não entram em volume cheio
+
+    eachListener(sound, function(player)
+        TriggerClientEvent('pr_3dsound:client:fadeOut', player, index, duration)
+    end)
     return true
 end
 
@@ -494,16 +639,28 @@ end
 
 local function GetAllSounds()
     local result = {}
-    for _, sound in pairs(Sounds) do
-        result[sound.uniqueId] = {
-            coords = packCoords(sound.coords), radius = sound.radius,
-            volume = sound.volume, isUrl = sound.isUrl, is2D = sound.is2D,
-            attachNetId = sound.attachNetId, loop = sound.loop,
-            paused = sound.paused, timestamp = elapsedSeconds(sound),
+    for _, v in pairs(Sounds) do
+        local listenerCount = 0
+        if v.listeners then for _ in pairs(v.listeners) do listenerCount = listenerCount + 1 end end
+
+        result[v.uniqueId] = {
+            coords = v.coords,
+            radius = v.radius,
+            volume = v.volume,
+            isUrl = v.isUrl,
+            is2D = v.is2D,
+            attachNetId = v.attachNetId,
+            paused = v.paused,
+            loop = v.loop,
+            listeners = listenerCount,
         }
     end
     return result
 end
+
+-- =============================================
+--  EXPORTS
+-- =============================================
 
 exports('Play', Play)
 exports('PlayUrl', PlayUrl)
@@ -526,147 +683,156 @@ exports('FadeOut', FadeOut)
 exports('SoundExists', SoundExists)
 exports('GetAllSounds', GetAllSounds)
 
--- ============================================================
--- Safe client bridge
--- ============================================================
--- Client-created URL sounds are self-only by default. A client can broadcast
--- only when granted ACE "pr_3dsound.broadcast". Trusted resources should use
--- the server exports above instead of TriggerServerEvent.
-
-local function claimOwner(uniqueId, src)
-    local index = getIndexByUniqueId(uniqueId)
-    if index and Sounds[index] then Sounds[index].ownerSource = src end
-end
-
-RegisterNetEvent('pr_3dsound:server:play', function(coords, soundName, volume, radius, uniqueId, resourceName, loop)
-    local src = source
-    if not clientRateAllowed(src) or not clientIdAvailable(src, uniqueId) or not coordsNearClient(src, coords) or not validSoundName(soundName) then return end
-    radius = clamp(radius or 30.0, 1.0, CFG.MAX_CLIENT_RADIUS)
-
-    if hasBroadcastAce(src) then
-        local id = Play(coords, soundName, volume, radius, uniqueId, resourceName, loop)
-        if id then claimOwner(id, src) end
-        return
-    end
-
-    -- Unprivileged requests are managed by the server but audible only to
-    -- the requesting player, so pause/stop/volume controls remain functional.
-    local index = getNextIndex(uniqueId)
-    uniqueId = uniqueId or ('client_%s_%s'):format(src, index)
-    local finalName = resourceName and resourceName ~= '' and (resourceName .. '/' .. soundName) or soundName
-    storeSound(index, {
-        kind = 'local', uniqueId = uniqueId, file = finalName,
-        coords = toCoords(coords), radius = radius,
-        volume = clamp(volume or 1.0, 0.0, 1.0),
-        isUrl = false, is2D = false, loop = loop == true,
-        targetSource = src, ownerSource = src,
-    })
-end)
-
-RegisterNetEvent('pr_3dsound:server:playUrl', function(name, url, volume, loop)
-    local src = source
-    if not clientRateAllowed(src) or not clientIdAvailable(src, name) or not validUrl(url) then return end
-    local target = hasBroadcastAce(src) and -1 or src
-    local id = PlayUrl(target, name, url, volume, loop)
-    if id then claimOwner(id, src) end
-end)
-
-RegisterNetEvent('pr_3dsound:server:playUrlPos', function(name, url, volume, coords, radius, loop)
-    local src = source
-    if not clientRateAllowed(src) or not clientIdAvailable(src, name) or not validUrl(url) or not coordsNearClient(src, coords) then return end
-    local target = hasBroadcastAce(src) and -1 or src
-    local id = PlayUrlPos(target, name, url, volume, coords, clamp(radius or 50.0, 1.0, CFG.MAX_CLIENT_RADIUS), loop)
-    if id then claimOwner(id, src) end
-end)
-
-local function handleClientPlayUrlAttached(src, name, url, volume, entityNetId, radius, loop)
-    if not clientRateAllowed(src) or not clientIdAvailable(src, name) or not validUrl(url) then return end
-    local entity = NetworkGetEntityFromNetworkId(tonumber(entityNetId) or -1)
-    if not entity or entity == 0 or not DoesEntityExist(entity) then return end
-    if not coordsNearClient(src, GetEntityCoords(entity)) then return end
-    local target = hasBroadcastAce(src) and -1 or src
-    local id = PlayUrlAttached(target, name, url, volume, entityNetId, clamp(radius or 30.0, 1.0, CFG.MAX_CLIENT_RADIUS), loop)
-    if id then claimOwner(id, src) end
-end
-
-RegisterNetEvent('pr_3dsound:server:playUrlAttached', function(name, url, volume, entityNetId, radius, loop)
-    handleClientPlayUrlAttached(source, name, url, volume, entityNetId, radius, loop)
-end)
-
-RegisterNetEvent('pr_3dsound:server:attachSoundToEntity', function(name, url, volume, entityNetId, radius, loop)
-    handleClientPlayUrlAttached(source, name, url, volume, entityNetId, radius, loop)
-end)
-
-local function guardedMutation(src, uniqueId, fn, ...)
-    local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
-    if not canClientMutate(src, sound) then return false end
-    return fn(uniqueId, ...)
-end
-
-RegisterNetEvent('pr_3dsound:server:attachToEntity', function(id, netId, offset) guardedMutation(source, id, AttachToEntity, netId, offset) end)
-RegisterNetEvent('pr_3dsound:server:detachEntity', function(id) guardedMutation(source, id, DetachEntity) end)
-RegisterNetEvent('pr_3dsound:server:pause', function(id) guardedMutation(source, id, Pause) end)
-RegisterNetEvent('pr_3dsound:server:resume', function(id) guardedMutation(source, id, Resume) end)
-RegisterNetEvent('pr_3dsound:server:stop', function(id) guardedMutation(source, id, Stop) end)
-RegisterNetEvent('pr_3dsound:server:updateCoords', function(id, coords)
-    if coordsNearClient(source, coords) then guardedMutation(source, id, UpdateCoords, coords) end
-end)
-RegisterNetEvent('pr_3dsound:server:setVolume', function(id, v) guardedMutation(source, id, SetVolume, v) end)
-RegisterNetEvent('pr_3dsound:server:setVolumeMax', function(id, v) guardedMutation(source, id, SetVolumeMax, v) end)
-RegisterNetEvent('pr_3dsound:server:setDistance', function(id, d) guardedMutation(source, id, SetDistance, clamp(d, 1.0, CFG.MAX_CLIENT_RADIUS)) end)
-RegisterNetEvent('pr_3dsound:server:setLoop', function(id, v) guardedMutation(source, id, SetLoop, v) end)
-RegisterNetEvent('pr_3dsound:server:setTimestamp', function(id, t) guardedMutation(source, id, SetTimestamp, t) end)
-RegisterNetEvent('pr_3dsound:server:fadeIn', function(id, d, v) guardedMutation(source, id, FadeIn, d, v) end)
-RegisterNetEvent('pr_3dsound:server:fadeOut', function(id, d) guardedMutation(source, id, FadeOut, d) end)
-RegisterNetEvent('pr_3dsound:server:stopAll', function()
-    if hasBroadcastAce(source) then StopAll() end
-end)
-
-RegisterNetEvent('pr_3dsound:server:soundEnded', function(uniqueId, token)
-    local src = source
-    local index = getIndexByUniqueId(uniqueId)
-    local sound = index and Sounds[index]
-    if not sound or sound.loop then return end
-    local listener = sound.listeners[src]
-    if not listener or listener.token ~= token then return end
-    Stop(uniqueId)
-end)
-
-AddEventHandler('playerDropped', function()
-    local src = source
-    clientCooldown[src] = nil
-    for _, sound in pairs(Sounds) do
-        sound.listeners[src] = nil
-        if sound.ownerSource == src and sound.targetSource == src then
-            -- Self-only client sounds are garbage-collected when their owner leaves.
-            sound._dropOwner = true
-        end
-    end
-    for index, sound in pairs(Sounds) do
-        if sound._dropOwner then Sounds[index] = nil end
-    end
-end)
+-- =============================================
+--  STREAMING DINÂMICO
+-- =============================================
 
 CreateThread(function()
     while true do
         Wait(CFG.STREAM_INTERVAL_MS)
-        local expired = {}
-        local now = nowMs()
+
+        local players = GetPlayers()
+        local positions = {}
+        for i = 1, #players do
+            local player = tonumber(players[i])
+            positions[player] = playerPosition(player)
+        end
+
+        local toStop = {}
 
         for index, sound in pairs(Sounds) do
-            if sound.expiresAtMs and now >= sound.expiresAtMs then
-                expired[#expired + 1] = sound.uniqueId
-            elseif sound.targetSnapshot and not sound.loop then
-                -- Initial-only local effects: only remove disconnected listeners.
-                for src, _ in pairs(sound.listeners) do
-                    if not GetPlayerName(src) then sound.listeners[src] = nil end
+            if not sound.is2D then
+                local entityOk = refreshSoundCoords(sound)
+
+                if sound.attachNetId and not entityOk then
+                    local missingFor = sound.entityMissingSince and (GetGameTimer() - sound.entityMissingSince) or 0
+
+                    -- Grace period: mantém quem já está ouvindo sem destruir o player.
+                    -- Se a entidade realmente não voltar, aí sim faz stream-out/stop.
+                    if missingFor >= CFG.ENTITY_MISSING_GRACE then
+                        streamOutAll(index, sound)
+                    end
+
+                    if missingFor >= CFG.ENTITY_MISSING_TIMEOUT then
+                        toStop[#toStop + 1] = index
+                    end
+                else
+                    for i = 1, #players do
+                        local player = tonumber(players[i])
+                        syncSpatialPlayer(index, sound, player, positions[player])
+                    end
+
+                    for player, _ in pairs(sound.listeners) do
+                        if positions[player] == nil then sound.listeners[player] = nil end
+                    end
                 end
             else
-                syncSound(index, sound)
+                for player, _ in pairs(sound.listeners) do
+                    if GetPlayerName(player) == nil then sound.listeners[player] = nil end
+                end
             end
         end
 
-        for i = 1, #expired do Stop(expired[i]) end
+        for i = 1, #toStop do stopIndex(toStop[i]) end
     end
 end)
+
+-- Sync após o client carregar/reiniciar a resource. O servidor pode ainda
+-- considerar esse player listener de uma execução anterior do client; limpamos
+-- apenas o estado desse player para forçar o reenvio correto.
+local lastSyncRequest = {}
+RegisterNetEvent('pr_3dsound:server:requestSync', function()
+    local src = source
+    local now = GetGameTimer()
+    if lastSyncRequest[src] and (now - lastSyncRequest[src]) < 1000 then return end
+    lastSyncRequest[src] = now
+
+    for _, sound in pairs(Sounds) do
+        if sound.listeners then sound.listeners[src] = nil end
+    end
+    syncPlayer(src)
+end)
+
+-- Cleanup de sons não-loop após o player realmente chegar ao fim.
+-- Só aceitamos de um listener atual e após ao menos 500 ms de vida.
+RegisterNetEvent('pr_3dsound:server:soundEnded', function(index)
+    local src = source
+    index = tonumber(index)
+    local sound = index and Sounds[index] or nil
+    if not sound or sound.loop or not sound.listeners or not sound.listeners[src] then return end
+    if (GetGameTimer() - (sound.createdAt or 0)) < 500 then return end
+    TriggerEvent('pr_3dsound:serverManagedEnded', sound.uniqueId, src)
+    stopIndex(index)
+end)
+
+RegisterNetEvent('pr_3dsound:server:soundError', function(index, reason)
+    local src = source
+    index = tonumber(index)
+    local sound = index and Sounds[index] or nil
+    if not sound or not sound.listeners or not sound.listeners[src] then return end
+
+    reason = type(reason) == 'string' and reason:sub(1, 240) or 'Falha ao reproduzir o stream.'
+    TriggerEvent('pr_3dsound:serverManagedError', sound.uniqueId, reason, src)
+    stopIndex(index)
+end)
+
+AddEventHandler('playerDropped', function()
+    local src = source
+    deniedOnce[src] = nil
+    lastSyncRequest[src] = nil
+
+    local toStop = {}
+    for index, sound in pairs(Sounds) do
+        if sound.listeners then sound.listeners[src] = nil end
+        if sound.targetSource == src then toStop[#toStop + 1] = index end
+    end
+
+    for i = 1, #toStop do stopIndex(toStop[i]) end
+end)
+
+-- =============================================
+--  NET EVENTS LEGADOS — protegidos por ACE
+-- =============================================
+
+local function guarded(fn)
+    return function(...)
+        local src = source
+        if not clientCanControl(src) then return end
+        return fn(src, ...)
+    end
+end
+
+RegisterNetEvent('pr_3dsound:server:play', guarded(function(_, coords, soundName, volume, radius, uniqueId, resourceName, loop)
+    Play(coords, soundName, volume, radius, uniqueId, resourceName, loop)
+end))
+
+RegisterNetEvent('pr_3dsound:server:playUrl', guarded(function(src, name, url, volume, loop)
+    PlayUrl(src, name, url, volume, loop)
+end))
+
+RegisterNetEvent('pr_3dsound:server:playUrlPos', guarded(function(src, name, url, volume, coords, radius, loop)
+    PlayUrlPos(src, name, url, volume, coords, radius, loop)
+end))
+
+RegisterNetEvent('pr_3dsound:server:playUrlAttached', guarded(function(src, name, url, volume, entityNetId, radius, loop)
+    PlayUrlAttached(src, name, url, volume, entityNetId, radius, loop)
+end))
+
+RegisterNetEvent('pr_3dsound:server:attachSoundToEntity', guarded(function(src, name, url, volume, entityNetId, radius, loop)
+    PlayUrlAttached(src, name, url, volume, entityNetId, radius, loop)
+end))
+
+RegisterNetEvent('pr_3dsound:server:attachToEntity', guarded(function(_, uniqueId, entityNetId, offset) AttachToEntity(uniqueId, entityNetId, offset) end))
+RegisterNetEvent('pr_3dsound:server:detachEntity', guarded(function(_, uniqueId) DetachEntity(uniqueId) end))
+RegisterNetEvent('pr_3dsound:server:pause', guarded(function(_, uniqueId) Pause(uniqueId) end))
+RegisterNetEvent('pr_3dsound:server:resume', guarded(function(_, uniqueId) Resume(uniqueId) end))
+RegisterNetEvent('pr_3dsound:server:stop', guarded(function(_, uniqueId) Stop(uniqueId) end))
+RegisterNetEvent('pr_3dsound:server:stopAll', guarded(function(_) StopAll() end))
+RegisterNetEvent('pr_3dsound:server:updateCoords', guarded(function(_, uniqueId, coords) UpdateCoords(uniqueId, coords) end))
+RegisterNetEvent('pr_3dsound:server:setVolume', guarded(function(_, uniqueId, volume) SetVolume(uniqueId, volume) end))
+RegisterNetEvent('pr_3dsound:server:setVolumeMax', guarded(function(_, uniqueId, volume) SetVolumeMax(uniqueId, volume) end))
+RegisterNetEvent('pr_3dsound:server:setDistance', guarded(function(_, uniqueId, dist) SetDistance(uniqueId, dist) end))
+RegisterNetEvent('pr_3dsound:server:setLoop', guarded(function(_, uniqueId, loopVal) SetLoop(uniqueId, loopVal) end))
+RegisterNetEvent('pr_3dsound:server:setTimestamp', guarded(function(_, uniqueId, time) SetTimestamp(uniqueId, time) end))
+RegisterNetEvent('pr_3dsound:server:fadeIn', guarded(function(_, uniqueId, dur, vol) FadeIn(uniqueId, dur, vol) end))
+RegisterNetEvent('pr_3dsound:server:fadeOut', guarded(function(_, uniqueId, dur) FadeOut(uniqueId, dur) end))
