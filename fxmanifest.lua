@@ -14,7 +14,8 @@ client_scripts {
 
 server_scripts {
     'server/server.lua',
-    'server/native_sound.lua'
+    'server/native_sound.lua',
+    'server/version.lua'
 }
 
 ui_page 'html/index.html'
@@ -23,7 +24,7 @@ files {
     'html/index.html',
     'html/scripts/*.js',
     'html/**/*.js',
-    'html/**/*.css',
+    --'html/**/*.css',
     -- sons proprios do pr_3dsound
     'html/sounds/*.ogg',
     'html/sounds/*.mp3',
@@ -31,5 +32,5 @@ files {
     -- sons de outros scripts em subpastas (ex: html/sounds/meu_script/pistola.ogg)
     'html/sounds/**/*.ogg',
     'html/sounds/**/*.mp3',
-    'html/sounds/**/*.weba',
+    --'html/sounds/**/*.weba',
 }
