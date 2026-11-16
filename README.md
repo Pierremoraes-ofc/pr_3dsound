@@ -25,7 +25,6 @@ Resource de áudio 3D para FiveM com arquivos locais, URLs diretas, YouTube, Sou
 ensure pr_3dsound
 ```
 
-3. Para produção, deixe `client/test_commands.lua` comentado no `fxmanifest.lua`.
 
 ## Uso recomendado: server-side
 
@@ -132,17 +131,6 @@ add_ace identifier.license:SUA_LICENSE pr_3dsound.broadcast allow
 ```
 
 Não conceda essa ACE para jogadores comuns.
-
-## Comandos de teste
-
-`client/test_commands.lua` continua incluído no pacote, mas está comentado no `fxmanifest.lua`.
-
-Para testar temporariamente:
-
-1. descomente `client/test_commands.lua`;
-2. conceda `pr_3dsound.broadcast` ao seu player se quiser que os testes transmitam para outros players;
-3. reinicie a resource;
-4. desabilite novamente em produção.
 
 ## Observações
 

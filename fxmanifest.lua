@@ -9,7 +9,6 @@ version '4.0.0'
 client_scripts {
     'client/client.lua',
     'client/native_sound.lua',
-    -- 'client/test_commands.lua', -- habilite apenas para testes; requer ACE nos controles server-side
 }
 
 server_scripts {
