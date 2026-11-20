@@ -4,7 +4,7 @@ game 'gta5'
 author 'PierreMoraes'
 name 'pr_3dsound'
 description '3D sound system — HRTF local/direct URL audio, persistent proximity streaming and entity attachment'
-version '4.0.0'
+version '4.0.2'
 
 client_scripts {
     'client/client.lua',
